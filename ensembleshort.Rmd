@@ -1,0 +1,1563 @@
+---
+title: "IPAH and PH-SSc vs HV and SSc-No-PH"
+author: "Niamh Errington"
+date: "`r format(Sys.time(), '%d %B %Y')`" 
+output: 
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    toc_collapsed: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
+library(kableExtra)
+```
+
+
+```{r, message = FALSE, warning = FALSE}
+source('~/Google Drive File Stream//My Drive/Work/Microarrays/2014 miRNA Arrays/Final Analysis/Scripts/Custom functions.R', chdir = TRUE)
+dataset <- read.csv("~/Google Drive File Stream/My Drive/miRNA/dataset.csv")
+
+library(pacman)
+p_load("kableExtra","caret","tidyverse","reshape2","e1071","JamesTools","OptimalCutpoints","Boruta","ggplot2","randomForest","ROCR","rpart","party","rpart.plot","partykit","glmnet","xgboost","Ringo", "parallel", "doParallel", "DMwR", "cowplot", "pROC", "readxl")
+
+rownames(dataset) <- dataset$X
+dataset<- select(dataset, -X)
+
+NTproBNP <- as.data.frame(read_excel("~/Google Drive File Stream/My Drive/miRNA/NTproBNP.xlsx"))
+pheno <- read_excel("~/Google Drive File Stream/My Drive/miRNA/NTproBNP.xlsx", 
+    sheet = "Sheet3")
+```
+
+```{r}
+ml.Spear <- dataset[dataset$AB == "A",] %>% select(.,-PHstatus,-AB)
+ml.Spear$group <- as.factor(ml.Spear$group)
+setB<- dataset[dataset$AB == "B",]  %>% select(.,-PHstatus,-AB)
+setB$group <- as.factor(setB$group)
+setB2 <- setB
+```
+
+
+# Boruta
+
+[Boruta](https://cran.r-project.org/web/packages/Boruta/Boruta.pdf) is a 'wrapper algorithm for all relevant feature selection'.
+
+```{r}
+#run boruta
+multi.boruta<- list()
+multi<- function(i){
+    fit.boruta <- Boruta(factor(group)~., data=ml.Spear, maxRuns = 300, pValue = 0.01)
+boruta.df <- data.frame(attStats(fit.boruta))
+multi.boruta[[i]] <- rownames(boruta.df[boruta.df$decision =='Confirmed',])
+}
+set.seed(100)
+multi.boruta<- parallel::mclapply(1:100, multi)
+
+#See how many times each miRNA appears when boruta is run 100x
+multi.boruta<- as.data.frame(table(unlist(multi.boruta)))
+multi.boruta.mirs<- as.character(multi.boruta[which(multi.boruta$Freq>10),1])
+multi.boruta
+```
+
+## Random Forest on Boruta
+
+```{r}
+ml.Spear$group <- as.factor((ml.Spear$group))
+m<- paste(as.vector(multi.boruta.mirs, mode = "any"), collapse = "+")
+RFm<- as.formula(paste("group ~ ",m,sep = ""))
+Boruta.data<- ml.Spear[,c("group",multi.boruta.mirs)]
+tree.Boruta<- setB[,c("group", multi.boruta.mirs)]
+```
+
+Using caret to train:
+
+10 fold cv, with 10 repeats.
+
+`mtry` - number of variables randomly sampled as candidates at each split (default is sqrt(no. of variables))
+
+`ntree` - number of trees to grow
+
+Can't optemise `ntree` and `mtry` in the same run, so optemise `ntree` first, using default `mtry`:
+
+```{r}
+control<- trainControl(method = 'repeatedcv',
+                       number = 10,
+                       repeats = 10, classProbs = TRUE, savePredictions = TRUE)
+metric <- "Accuracy"
+tunegrid <- expand.grid(.mtry=seq(from =1, to =4))
+modellist<- list()
+for (ntree in c(100, 250, 500, 750, 1000, 1250, 1500)) {
+	set.seed(100)
+	fit <- caret::train(RFm, data=Boruta.data, method="rf", metric=metric, tuneGrid=tunegrid, trControl=control, ntree=ntree)
+	key <- toString(ntree)
+	modellist[[key]] <- fit
+}
+# compare results
+results <- resamples(modellist)
+res<- summary(results)
+res<- as.data.frame(res$statistics$Accuracy)
+summary(results)
+```
+
+Now optmise `mtry`:
+
+```{r}
+ntree = as.numeric(rownames(res)[which(res$Mean == max(res$Mean))])[1]
+set.seed(100)
+tunegrid <- expand.grid(.mtry=seq(from = 1, to=4, by = 0.5))
+modellist<- list()
+control<- trainControl(method = 'repeatedcv',
+                       number = 10,
+                       repeats = 10, classProbs = TRUE, savePredictions = TRUE)
+	set.seed(100)
+fit <- caret::train(RFm, data=Boruta.data, method="rf", metric="Accuracy", tuneGrid=tunegrid, trControl=control, ntree=ntree)
+fit
+```
+
+
+```{r}
+paste("ntree used:", ntree)
+tunegrid <- expand.grid(.mtry=fit$bestTune$mtry)
+control<- trainControl(method = 'repeatedcv',
+                       number = 10,
+                       repeats = 10,
+                       savePredictions = TRUE,
+                       classProbs = TRUE)
+fit.Boruta <- caret::train(RFm, data=Boruta.data, method="rf", metric="Accuracy", tuneGrid=tunegrid, trControl=control, ntree=ntree)
+RFBoruta.train <- predict(fit.Boruta, tree.Boruta)
+BorutaInterim<- confusionMatrix(as.factor(RFBoruta.train), as.factor(tree.Boruta$group), positive = "PH")
+BorutaInterim
+```
+
+# Rpart 
+
+The `rpart` function from the [`rpart`](https://cran.r-project.org/web/packages/rpart/rpart.pdf) package can be utilised to grow a regression tree. This tree is built by splitting the data on the single variable which best splits the group in 2. Once the data is separated, this process is applied to each sub-group separately recursively until the subgroups reach a minimum size (defined as 3 below), or no improvement can be made. 
+
+Rpart uses a variable selection algorithm called recursive feature elimination (REF, also known as backward selection). 
+
+`minsplit` - min no of observations that must exist in a node in order for a split to be attempted
+`minbucket` - min no of observations in any terminal node
+
+```{r}
+		#train control
+tc <- trainControl(method="repeatedcv", number=10, repeats = 10, classProbs=TRUE, summaryFunction = twoClassSummary, savePredictions = TRUE)
+#maxcompete
+
+set.seed(20)
+fit.caret.rpart <- caret::train(group ~ ., data=ml.Spear, method='rpart', metric="ROC", trControl=tc, control=rpart.control(minsplit=2, minbucket=3, surrogatestyle = 1, maxcompete = )) 
+fit.caret.rpart$bestTune
+```
+
+```{r}
+prp(fit.caret.rpart$finalModel, main="PH from HV Rpart model", extra=2, varlen=0)
+plot(as.party(fit.caret.rpart$finalModel), main="PH from HV Rpart model", drop_terminal=F)
+
+```
+
+### B validation
+
+```{r}
+rpartmirs<-labels(fit.caret.rpart$finalModel)[-1]
+rpartmirs<- gsub("<.*","", rpartmirs)
+rpartmirs<- unique(gsub(">.*","", rpartmirs))
+
+predrpart2 <- predict(fit.caret.rpart, setB2)
+
+fit.preds.table.Rpart<- cbind(rownames(setB2),predrpart2,as.character(setB2$group))
+fit.preds.table.Rpart<- as.data.frame(fit.preds.table.Rpart)
+colnames(fit.preds.table.Rpart) <- c("sample","fit.preds","group")
+
+RpartInterim<- confusionMatrix(predrpart2, setB2$group, positive = "PH")
+RpartInterim
+```
+
+
+# LASSO
+
+LASSO (Least Absolute Shrinkage and Selection Operator) is a feature selection method designed to reduce over-fitting. It automatically selects the significant variables by shrinking the coefficients of predictors deemed unimportant to zero.
+
+`Glmnet` ([Vignette](http://web.stanford.edu/~hastie/glmnet/glmnet_alpha.html)) is a package that uses penalised maximum likelihood to fit a generalised linear model. 
+
+```{r}
+fit.glmcv <- cv.glmnet(x=as.matrix(ml.Spear[-1]), y=as.factor(ml.Spear$group), alpha=1, family='binomial', nfolds=10)
+#summary(fit.glmcv)
+other.glmcv <- cv.glmnet(x=as.matrix(ml.Spear[-1]), y=as.factor(ml.Spear$group), alpha=1, family='binomial', nfolds=10, type.measure = "class")
+model.lambda <- fit.glmcv$lambda.min
+
+plot(fit.glmcv, cex.axis=1, cex.lab=1,cex.main=1)
+plot(other.glmcv, cex.axis=1, cex.lab=1, cex.main=1)
+```
+
+In the plot above, the red indicates the cross validation curve, and the the error bars show upper and lower standard deviation curves. 
+
+The two dotted lines show `lambda.min` - the value of $\lambda$ that gives minimum mean cross-validated error. The other $\lambda$ is `lambda.1se`, which gives the most regularised model such that the error is within 1 standard error of the minimum. 
+
+
+```{r}
+#refit model for new lambda
+paste("lambda value:", fit.glmcv$lambda.min)
+tuneLASSO<- expand.grid(.alpha = 1, .lambda = fit.glmcv$lambda.min)
+LASSO.min<- caret::train(group ~ ., data = ml.Spear, method = "glmnet", trControl = control, family = 'binomial', tuneGrid = tuneLASSO)
+lasso.model<- coef(LASSO.min$finalModel, LASSO.min$bestTune$lambda) %>% as.matrix() %>% as.data.frame() %>% rownames_to_column %>% filter(abs(`1`) >0)
+
+ml.Spear.LASSO <- cbind("group" = ml.Spear$group, ml.Spear[,colnames(ml.Spear) %in% lasso.model$rowname])
+
+paste("Number of miRs in LASSO model:",length(lasso.model$rowname)-1)
+kable(lasso.model, caption = "miRs retained by LASSO") %>% kable_styling(full_width = TRUE)
+
+```
+
+## Validation on B
+
+```{r}
+val.LASSO<- setB[, colnames(setB) %in% colnames(ml.Spear)]
+LASSO.pred.min <- predict(LASSO.min, newdata=val.LASSO[-1])
+predicted.classes<-as.character(LASSO.pred.min)
+fit.preds.table.LASSO<- as.data.frame(cbind(as.character(rownames(setB)),as.character(predicted.classes),as.character(setB2$group)))
+colnames(fit.preds.table.LASSO) <- c("sample","LASSO","group")
+LASSOInterim<- confusionMatrix(LASSO.pred.min,val.LASSO$group, positive = "PH")
+LASSOInterim
+```
+
+
+
+# XGBoost
+
+[XGBoost](https://cran.r-project.org/web/packages/xgboost/xgboost.pdf) (**Ex**treme **G**radient **B**oosting) is an optimised distributed gradient boosting library that performs better than gradient boosting (GBM) framework alone. 
+
+## Parameters for tuning
+
+`nrounds` - maximum number of iterations (similar to no. of trees grown). 
+
+`eta` - [range: (0,1)] - learning rate. After every round, it shrinks the feature weights to reach the best optimum. Lower eta = slower computation 
+
+`gamma` [range: $(0,\infty)$] - controls regularisation (prevents over-fitting)
+
+`max_depth` [range: $(0,\infty)$] - controls the tree depth. The larger the depth, the more complex the model and the higher the chances of over-fitting. Larger data sets require deep trees
+
+`min_child_weight` [range: $(0,\infty)$] - In classification, if the leaf node has a minimum sum of instance weight lower than min_child_weight, the tree splitting stops. I.e. it stops potential future interactions to reduce over-fitting
+
+`subsample` [range: (0,1)] - Controls the number of samples supplied to a tree
+
+`colsample_bytree` [range: (0,1)] - controls the no. of features (variables) supplied to a tree
+
+| Parameter          | Default |Range       | Values attempted                | Final model |
+|--------------------|---------|------------|---------------------------------|-------------|
+|`nrounds`          | 100     |             | 100 - 10 000                    | 200 |
+|`eta`              | 0.3     |(0,1)         |0.01, 0.025, 0.05, 0.1, 0.2, 0.3 | 0.025 |
+|`gamma`            | 0       | $(0,\infty)$ | 0,0.05, 0.1, 0.5, 0.7, 0.9, 1   | 0.05 |
+| `max_depth`       | 6       | $(0,\infty)$ | 1, 2, 3, 4, 5, 6                   | 1 |
+|`colsample_bytree` | 1       | (0,1)       | 0.4, 0.6, 0.8, 1.0              | 0.6 |
+|`subsample`        | 1       | (0,1)       |0.5, 0.75, 1.0                   | 0.5 |
+|`min_child_weight` | 1       | $(0,\infty)$ | 1, 2, 3, 4                         | 1 |
+
+The default metric to determine the best settings in train is accuracy, with Kappa also being calculated for a classification model.
+
+## Default 
+
+```{r}
+library(xgboost)
+train<- ml.Spear[-1]
+train<- data.matrix(train)
+validation<- setB[-1]
+validation<- data.matrix(validation)
+
+labels<- ml.Spear$group 
+
+#Set up XGBoost with default hyperparameters
+grid_default <- expand.grid(
+  nrounds = 100,
+  max_depth = 6,
+  eta = 0.3,
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+train_control <- caret::trainControl(
+  method = "none",
+  verboseIter = FALSE, # no training log
+  allowParallel = TRUE 
+)
+
+```
+
+```{r}
+xgb_base<- caret::train( 
+  x = train,
+  y = as.factor(labels),
+  trControl = train_control,
+  tuneGrid = grid_default,
+  method = "xgbTree",
+  verbose = TRUE,
+  scale_pos_weight = (72/43) #(Total no. samples / no. positive in groupA)
+  )
+
+xgbpredict_base<- predict(xgb_base, validation)
+confusionMatrix(xgbpredict_base, as.factor(setB$group), positive = "PH")
+```
+
+```{r}
+nrounds<- seq(from = 100, to =1000, by = 50)
+#tune using caret
+tune_grid <- expand.grid(
+  #nrounds = seq(from = 100, to = 1000, by = 20),
+  nrounds = nrounds,
+  eta = 0.05,
+  max_depth = c(1, 2, 3),
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+set.seed(25)
+tune_control <- caret::trainControl(
+  method = "repeatedcv", # cross-validation
+  number = 10, # with n folds
+  repeats = 10, #the no. of complete sets of folds to compute
+  #index = createFolds(tr_treated$Id_clean), # fix the folds
+  verboseIter = FALSE, # no training log
+  allowParallel = TRUE 
+)
+
+set.seed(25)
+xgb_tune <- caret::train(
+  x = train,
+  y = as.factor(labels),
+  trControl = tune_control,
+  tuneGrid = tune_grid,
+  method = "xgbTree",
+  verbose = TRUE
+  #,   scale_pos_weight = (35/21)- 1
+)
+kable(xgb_tune$bestTune, caption = "1st tuning, best parameters")%>% kable_styling(full_width = TRUE)
+
+```
+
+```{r}
+tune_grid2 <- expand.grid(
+  nrounds = nrounds,
+  eta = 0.05,
+  max_depth = c(xgb_tune$bestTune$max_depth -1, xgb_tune$bestTune$max_depth, xgb_tune$bestTune$max_depth +1),
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = c(0,1,2,3,4),
+  subsample = 1
+)
+
+set.seed(25)
+xgb_tune2 <- caret::train(
+  x = train,
+  y = as.factor(labels),
+  trControl = tune_control,
+  tuneGrid = tune_grid2,
+  method = "xgbTree",
+  verbose = TRUE
+  #,  scale_pos_weight = (35/21) -1
+)
+
+kable(xgb_tune2$bestTune, caption = "2nd tuning, best parameters")%>% kable_styling(full_width = TRUE)
+```
+
+```{r}
+tune_grid3 <- expand.grid(
+  nrounds = nrounds,
+  eta = 0.05,
+  max_depth = xgb_tune2$bestTune$max_depth,
+  gamma = 0,
+  colsample_bytree = c(0.4, 0.6, 0.8, 1.0),
+  min_child_weight = xgb_tune2$bestTune$min_child_weight,
+  subsample = c(0.5, 0.75, 1.0)
+)
+
+set.seed(25)
+xgb_tune3 <- caret::train(
+  x = train,
+  y = as.factor(labels),
+  trControl = tune_control,
+  tuneGrid = tune_grid3,
+  method = "xgbTree",
+  verbose = TRUE
+  #,   scale_pos_weight = (35/21) -1
+)
+
+kable(xgb_tune3$bestTune, caption = "3rd tuning, best parameters")%>% kable_styling(full_width = TRUE)
+```
+
+```{r}
+tune_grid4 <- expand.grid(
+  nrounds = nrounds,
+  eta = 0.05,
+  max_depth = xgb_tune3$bestTune$max_depth,
+  gamma = c(0,0.05, 0.1, 0.5, 0.7, 0.9, 1),
+  colsample_bytree = xgb_tune3$bestTune$colsample_bytree,
+  min_child_weight = xgb_tune2$bestTune$min_child_weight,
+  subsample = xgb_tune3$bestTune$subsample
+)
+
+set.seed(25)
+xgb_tune4 <- caret::train(
+  x = train,
+  y = as.factor(labels),
+  trControl = tune_control,
+  tuneGrid = tune_grid4,
+  method = "xgbTree",
+  verbose = TRUE
+  #,  scale_pos_weight = (35/21) -1
+)
+
+kable(xgb_tune4$bestTune, caption = "4th tuning, best parameters")%>% kable_styling(full_width = TRUE)
+```
+
+```{r}
+tune_grid5 <- expand.grid(
+  nrounds = seq(from = 100, to = 10000, by = 50),
+  eta = c(0.01,0.025,0.05,0.1),
+  max_depth = xgb_tune3$bestTune$max_depth,
+  gamma = xgb_tune4$bestTune$gamma,
+  colsample_bytree = xgb_tune3$bestTune$colsample_bytree,
+  min_child_weight = xgb_tune2$bestTune$min_child_weight,
+  subsample = xgb_tune3$bestTune$subsample
+)
+
+set.seed(25)
+xgb_tune5 <- caret::train(
+  x = train,
+  y = as.factor(labels),
+  trControl = tune_control,
+  tuneGrid = tune_grid5,
+  method = "xgbTree",
+  verbose = TRUE
+  #,  scale_pos_weight = (35/21) -1
+)
+
+kable(xgb_tune5$bestTune, caption = "5th tuning, best parameters")%>% kable_styling(full_width = TRUE)
+```
+
+
+
+```{r}
+#look at features from final model
+xgblabels <- ifelse(labels == "PH", 1,0)
+xgb_final<- xgboost(data = train, label = xgblabels, nrounds = xgb_tune5$bestTune$nrounds, objective = "binary:logistic", max_depth = xgb_tune5$bestTune$max_depth, eta = xgb_tune5$bestTune$eta, min_child_weight = xgb_tune5$bestTune$min_child_weight, verbose = 0)
+importance_final<- xgb.importance(feature_names = colnames(train), model = xgb_final)
+xgb_mirs<- importance_final[importance_final$Gain>0.05,]
+
+kable(xgb_mirs, caption = "Important Features (Gain > 0.05)")%>% kable_styling(full_width = TRUE)
+
+gg<- xgb.ggplot.importance(importance_matrix = xgb_mirs)
+gg+ggplot2::theme(legend.position = "none", text = element_text(size = 22), axis.text = element_text(size = 18))
+
+xgbpredictfinal<- predict(xgb_tune5, validation)
+xgbpredictfinal_probs<- predict(xgb_tune5, validation, type = "prob")
+confusionMatrix(xgbpredictfinal, as.factor(setB$group), positive = "PH")
+```
+
+# XGBoost on selcted miRs
+
+```{r}
+setAshort<- ml.Spear[,c("group",xgb_mirs$Feature)]
+setBshort<- setB[,c("group",xgb_mirs$Feature)]
+train.short<- data.matrix(setAshort[-1])
+validation.short<- data.matrix(setBshort[-1])
+
+labels<- setAshort$group 
+setBshort$group <- setB$group
+
+#Set up XGBoost with default hyperparameters
+grid_default <- expand.grid(
+  nrounds = 100,
+  max_depth = 6,
+  eta = 0.3,
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+train_control <- caret::trainControl(
+  method = "none",
+  verboseIter = FALSE, # no training log
+  allowParallel = TRUE 
+)
+
+xgb_base_short<- caret::train( 
+  x = train.short,
+  y = as.factor(labels),
+  trControl = train_control,
+  tuneGrid = grid_default,
+  method = "xgbTree",
+  verbose = TRUE
+  )
+
+xgbpredict_base_short<- predict(xgb_base_short, validation.short)
+confusionMatrix(xgbpredict_base_short, as.factor(setBshort$group), positive = "PH")
+```
+
+## First Tune
+
+Check model accuracy for different tree depths, for nrounds between 100 and 1000
+
+```{r}
+nrounds<- seq(from = 100, to =1000, by = 50)
+#tune using caret
+tune_grid <- expand.grid(
+  #nrounds = seq(from = 100, to = 1000, by = 50),
+  nrounds = nrounds,
+  eta = c(0.025, 0.05, 0.1, 0.2, 0.3),
+  max_depth = c(1, 2, 3, 4, 5, 6),
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+set.seed(25)
+tune_control <- caret::trainControl(
+  method = "repeatedcv", # cross-validation
+  number = 10, # with n folds
+  repeats = 10, #the no. of complete sets of folds to compute
+  #index = createFolds(tr_treated$Id_clean), # fix the folds
+  verboseIter = FALSE, # no training log
+  allowParallel = TRUE,
+  savePredictions = TRUE
+)
+
+set.seed(25)
+xgb_tune_short <- caret::train(
+  x = train.short,
+  y = as.factor(labels),
+  trControl = tune_control,
+  tuneGrid = tune_grid,
+  method = "xgbTree",
+  verbose = TRUE
+)
+
+kable(xgb_tune_short$bestTune, caption = "1st tuning, best parameters")%>% kable_styling(full_width = TRUE)
+
+```
+
+## Second Tune - Maximum Depth and Minimum Child Weight
+
+```{r}
+tune_grid2_short <- expand.grid(
+  nrounds = nrounds,
+  eta = xgb_tune_short$bestTune$eta,
+  max_depth = c(xgb_tune_short$bestTune$max_depth -1, xgb_tune_short$bestTune$max_depth, xgb_tune_short$bestTune$max_depth +1),
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = c(1,2,3,4),
+  subsample = 1
+)
+
+set.seed(25)
+xgb_tune2_short <- caret::train(
+  x = train.short,
+  y = as.factor(labels),
+  trControl = tune_control,
+  tuneGrid = tune_grid2_short,
+  method = "xgbTree",
+  verbose = TRUE
+)
+
+kable(xgb_tune2_short$bestTune, caption = "2nd tuning, best parameters")%>% kable_styling(full_width = TRUE)
+```
+
+Minimum Sum of Instance Weight refers to the `min_child_weight` parameter
+
+## Third tune - Column and Row sampling
+
+```{r}
+tune_grid3_short <- expand.grid(
+  nrounds = nrounds,
+  eta = xgb_tune_short$bestTune$eta,
+  max_depth = xgb_tune2_short$bestTune$max_depth,
+  gamma = 0,
+  colsample_bytree = c(0.4, 0.6, 0.8, 1.0),
+  min_child_weight = xgb_tune2_short$bestTune$min_child_weight,
+  subsample = c(0.5, 0.75, 1.0)
+)
+
+set.seed(25)
+xgb_tune3_short <- caret::train(
+  x = train.short,
+  y = as.factor(labels),
+  trControl = tune_control,
+  tuneGrid = tune_grid3_short,
+  method = "xgbTree",
+  verbose = TRUE
+)
+
+kable(xgb_tune3_short$bestTune, caption = "3rd tuning, best parameters")%>% kable_styling(full_width = TRUE)
+```
+
+## Fourth tune - gamma
+
+```{r}
+tune_grid4_short <- expand.grid(
+  nrounds = nrounds,
+  eta = xgb_tune_short$bestTune$eta,
+  max_depth = xgb_tune3_short$bestTune$max_depth,
+  gamma = c(0,0.05, 0.1, 0.5, 0.7, 0.9, 1),
+  colsample_bytree = xgb_tune3_short$bestTune$colsample_bytree,
+  min_child_weight = xgb_tune2_short$bestTune$min_child_weight,
+  subsample = xgb_tune3_short$bestTune$subsample
+)
+
+set.seed(25)
+xgb_tune4_short <- caret::train(
+  x = train.short,
+  y = as.factor(labels),
+  trControl = tune_control,
+  tuneGrid = tune_grid4_short,
+  method = "xgbTree",
+  verbose = TRUE
+)
+
+kable(xgb_tune4_short$bestTune, caption = "4th tuning, best parameters")%>% kable_styling(full_width = TRUE)
+```
+
+## Fifth tune - Reducing Learning Rate
+
+```{r}
+tune_grid5_short <- expand.grid(
+  nrounds = seq(from = 100, to = 10000, by = 50),
+  eta = c(0.01,0.025,0.05,0.1),
+  max_depth = xgb_tune3_short$bestTune$max_depth,
+  gamma = xgb_tune4_short$bestTune$gamma,
+  colsample_bytree = xgb_tune3_short$bestTune$colsample_bytree,
+  min_child_weight = xgb_tune2_short$bestTune$min_child_weight,
+  subsample = xgb_tune3_short$bestTune$subsample
+)
+
+set.seed(25)
+xgb_tune5_short <- caret::train(
+  x = train.short,
+  y = as.factor(labels),
+  trControl = tune_control,
+  tuneGrid = tune_grid5_short,
+  method = "xgbTree",
+  verbose = TRUE
+)
+
+kable(xgb_tune5_short$bestTune, caption = "5th tuning, best parameters")%>% kable_styling(full_width = TRUE)
+```
+
+## Final model
+
+```{r}
+final_grid_short <- expand.grid(
+  nrounds = xgb_tune5_short$bestTune$nrounds,
+  eta = xgb_tune5_short$bestTune$eta,
+  max_depth = xgb_tune5_short$bestTune$max_depth,
+  gamma = xgb_tune5_short$bestTune$gamma,
+  colsample_bytree = xgb_tune5_short$bestTune$colsample_bytree,
+  min_child_weight = xgb_tune5_short$bestTune$min_child_weight,
+  subsample = xgb_tune5_short$bestTune$subsample
+)
+
+set.seed(25)
+tune_control_f <- caret::trainControl(
+  method = "repeatedcv", # cross-validation
+  number = 10, # with n folds
+  repeats = 10, #the no. of complete sets of folds to compute
+  #index = createFolds(tr_treated$Id_clean), # fix the folds
+  verboseIter = FALSE, # no training log
+  allowParallel = TRUE,
+  savePredictions = TRUE,
+  classProbs = TRUE
+)
+set.seed(25)
+xgb_tune_final_short <- caret::train(
+  x = train.short,
+  y = as.factor(labels),
+  trControl = tune_control_f,
+  tuneGrid = final_grid_short,
+  method = "xgbTree",
+  verbose = TRUE
+)
+
+xgbpredictfinalshort<- predict(xgb_tune_final_short, validation.short)
+XGBInterim<- confusionMatrix(xgbpredictfinalshort, as.factor(setBshort$group), positive = "PH")
+XGBInterim
+```
+
+
+# Univariate analysis 
+
+```{r}
+#mir in any feature selection method
+all.mirs<- unique(c(lasso.model$rowname[-1],multi.boruta.mirs, as.character(rpartmirs), xgb_mirs$Feature))
+#miRs in at least 2 selection methods
+mirnames<- duplicated(c(lasso.model$rowname[-1],multi.boruta.mirs, rpartmirs, xgb_mirs$Feature))
+mirnames<- c(lasso.model$rowname[-1],multi.boruta.mirs, rpartmirs, xgb_mirs$Feature)[mirnames] %>% unique(.)
+
+
+```
+
+miRNA in any feature selection method: 
+
+`all.mirs`
+
+miRNAs in at least 2 feature selection methods:
+
+`mirnames`
+
+## ROC
+
+ROC curves for all microRNAs selected by either LASSO, Rpart, Boruta or XGBoost. NB calculated across all HV and PAH , not traning set
+
+```{r, message = FALSE, warning=FALSE}
+#ROC curves for IPAH
+library(pROC)
+roc.res.i <- list()
+     for(i in all.mirs){
+          #Save ROC data
+         roc.res.i[[i]] <- roc(dataset$group, dataset[,i], plot=F)
+         plot.roc(roc.res.i[[i]], lwd = 5, cex.axis = 1, cex.lab = 1, cex.main = 1, main=paste("ROC for",i))
+     }
+```
+
+```{r}
+cutoffs <- find.Cutpoints.Loop(all.mirs, data=ml.Spear[-1], pheno=ml.Spear[,1], healthytag="PH", method='MaxSpSe')
+kable(cutoffs, caption = "Cutpoints for miRNAs selected by the above methods, calculated on the training set") %>% kable_styling(full_width = TRUE)
+```
+
+miR-187-5p
+
+```{r}
+m187cut <- cutoffs %>% filter(mir == "miR.187.5p")
+m187tab<- table(ifelse(setB$miR.187.5p > m187cut$cutpoint, "PH", "HV"), setB$group)
+(m187tab[1]+m187tab[4])/sum(m187tab)
+```
+
+miR-636
+
+```{r}
+m636cut <- cutoffs %>% filter(mir == "miR.636")
+m636tab<- table(ifelse(setB$miR.636 < m636cut$cutpoint, "PH","HV"), setB$group)
+(m636tab[1]+m636tab[4])/sum(m636tab)
+```
+
+## Wilcox Tests
+
+```{r}
+compared<- dataset[,c("group", all.mirs)]
+
+sigs<- list()
+  for(i in 2:(length(compared))) {
+    sigs[[i]] <- wilcox.test(
+      compared[compared$group == "HV",i],
+      compared[compared$group == "PH",i], alternative = "two.sided"
+    )
+  }
+  names(sigs)<- colnames(compared)
+sigs <-  sigs[-1]
+
+df<- data.frame(mir.name=character(),p.value=double() ,stringsAsFactors = FALSE)
+
+for(i in 1:length(sigs)) {
+  unlist(sigs[i])
+ df[i,] <- c(names(sigs[i]),sigs[[i]]$p.value)
+}
+
+df$p.adj.BH<- p.adjust(df$p.value, method = "BH")
+rownames(df)<- df$mir.name
+
+kable(df[-1], caption = "Wilcox tests, adjusted p-value BH method, miRs selcted by feature selection") %>%  kable_styling(full_width = TRUE)
+```
+
+# Model MicroRNAs
+
+Summary statistics for PH group:
+
+```{r}
+#pick mirs selected by any of the 3 methods
+selectedmirs <- c("group",all.mirs)
+
+#reduce dataframe to contain only mirs in selectedmirs
+selecmirs<- ml.Spear[, colnames(ml.Spear) %in% selectedmirs]
+#melt dataframe so ggplot can be used
+df<- melt(selecmirs, id.var = "group") %>% mutate (group = factor(group, ))
+
+#print summaries of PH and HV groups
+H<- selecmirs[selecmirs$group == "HV",]
+PH<- selecmirs[selecmirs$group == "PH",]
+summary(PH)
+```
+
+Summary statistics for healthy volunteers:
+
+```{r}
+summary(H)
+
+ggplot(data = df, aes(x= variable, y=value)) + geom_boxplot(aes(fill=group)) + theme(text = element_text(size=12), axis.text.x=element_text(angle=90, vjust=0.5, size = 12),axis.text.y=element_text(size = 12)) + labs(x="", y="Expression", size = 12)
+```
+
+
+```{r}
+#melt dataframe into SSc, SSc-no-ph, IPAH, HV
+selectedmirs <- c("PHstatus",all.mirs)
+
+#reduce dataset to contain only mirs in selectedmirs - all subjects not just set A
+selecmirs2<- dataset[,which(colnames(dataset) %in% selectedmirs)]
+dfSSc<- melt(selecmirs2, id.var = "PHstatus")
+dfSSc$PHstatus<- factor(dfSSc$PHstatus, levels = c("HV","No_PH_CTD","CTD_PAH","IPAH"))
+dfSScPH<- dfSSc[dfSSc$PHstatus == 'CTD_PAH' | dfSSc$PHstatus == 'IPAH', ]
+ggplot(data = dfSScPH, aes(x= variable, y=value)) + geom_boxplot(aes(fill=PHstatus)) + theme(axis.text.x=element_text(angle=90, vjust=0.5, size = 12),axis.text.y=element_text(size = 12)) + labs(x="", y="Expression")
+```
+
+```{r}
+ggplot(data = dfSSc, aes(x= variable, y=value)) + geom_boxplot(aes(fill=PHstatus)) + theme(axis.text.x=element_text(angle=90, vjust=0.5, size = 12),axis.text.y=element_text(size = 12)) + labs(x="", y="Expression")
+```
+
+
+## miRs in more than one feature selection method
+
+```{r}
+#melt dataframe into SSc, SSc-no-ph, IPAH, HV
+mormirs <- c("group",unique(mirnames))
+
+#reduce datset to contain only mirs in selectedmirs
+moremirs<- dataset[,mormirs]
+moremirs<- melt(moremirs, id.var = "group")
+
+ggplot(data = moremirs, aes(x= variable, y=value)) + geom_boxplot(aes(fill=group)) + theme(axis.text.x=element_text(angle=90, vjust=0.5, size = 12),axis.text.y=element_text(size = 12),axis.title.y=element_text(size=12)) + labs(x="", y="Expression") 
+
+moremirsAB<- dataset[,which(colnames(dataset) %in% c(unique(mirnames), "AB"))]
+AB<- moremirsAB %>% melt(id.var = "AB")
+
+ggplot(data = AB, aes(x= variable, y=value)) + geom_boxplot(aes(fill=AB)) + theme(axis.text.x=element_text(angle=90, vjust=0.5, size = 12),axis.text.y=element_text(size = 12)) + labs(x="", y="Expression")
+
+final2<- moremirs[moremirs$variable =="miR-636" | moremirs$variable =="miR-187-5p" ,]
+#ggplot(data = final3, aes(x= variable, y=value)) + geom_boxplot(aes(fill=group),size=1.2) + theme(axis.text.x=element_text(angle=60, vjust=0.5, size = 16),axis.text.y=element_text(size = 12),axis.title.y=element_text(size=12), legend.text = element_text(size = 12)) + labs(x="", y="Expression")
+
+```
+
+# CV ROCs
+
+## Boruta
+
+```{r, message=FALSE, warning = FALSE}
+boruta.split<- split(fit.Boruta$pred, fit.Boruta$pred$Resample)
+parallel::mclapply(1:100, function(d) {
+  pROC::auc(pROC::roc(predictor = boruta.split[[d]]$PH, response = boruta.split[[d]]$obs))[1]
+}) %>% unlist() %>% hist(main = paste("Boruta CV mean AUC:", round(mean(.),2)))
+```
+
+## Rpart
+
+```{r, warning=FALSE, message=FALSE}
+rpart.auc<- list()
+rpart.split<- split(fit.caret.rpart$pred, fit.caret.rpart$pred$Resample)
+parallel::mclapply(1:100, function(d) {
+  pROC::auc(pROC::roc(predictor = rpart.split[[d]]$PH, response = rpart.split[[d]]$obs))[1]
+}) %>% unlist() %>% hist(main = paste("Rpart CV mean AUC:", round(mean(.),2)))
+
+```
+
+## LASSO (caret model - lambda min)
+
+```{r, warning = FALSE, message=FALSE}
+LASSO.split.min<- split(LASSO.min$pred, LASSO.min$pred$Resample)
+parallel::mclapply(1:100, function(d) {
+  pROC::auc(pROC::roc(predictor = LASSO.split.min[[d]]$PH, response = LASSO.split.min[[d]]$obs))[1]
+}) %>% unlist() %>% hist(main = paste("LASSO CV mean AUC:", round(mean(.),2)))
+```
+
+## XGBoost
+
+```{r, warning = FALSE, message=FALSE}
+tosplit<- xgb_tune_final_short
+XGB.split<- split(tosplit$pred, tosplit$pred$Resample)
+parallel::mclapply(1:100, function(d) {
+  pROC::auc(pROC::roc(predictor = XGB.split[[d]]$PH, response = XGB.split[[d]]$obs))[1]
+}) %>% unlist() %>% hist(main = paste("XGBoost CV mean AUC:", round(mean(.),2)))
+```
+
+# ROC on interim set
+
+## Boruta
+
+```{r}
+Boruta.perf<- predict(fit.Boruta, tree.Boruta[-1], type= "prob")
+Boruta.pred<- prediction(Boruta.perf$PH, tree.Boruta$group)
+Boruta.perfs<- ROCR::performance(Boruta.pred,"tpr","fpr")
+Boruta.sens<- ROCR::performance(Boruta.pred,"sens","spec")
+Boruta.auc <- pROC::auc(tree.Boruta$group, Boruta.perf[,2])
+Boruta.aucCI<- pROC::ci.auc(tree.Boruta$group, Boruta.perf[,2])
+par(mfrow=c(1,2))
+plot(Boruta.perfs, main = paste("AUC:", round(Boruta.auc,2)))
+plot(Boruta.sens)
+Boruta.aucCI
+```
+
+## Rpart
+
+```{r}
+rpart.perf<- predict(fit.caret.rpart, setB2[-1], type= "prob")
+rpart.pred<- prediction(rpart.perf$PH, setB2$group)
+rpart.perfs<- ROCR::performance(rpart.pred,"tpr","fpr")
+rpart.sens<- ROCR::performance(rpart.pred,"sens","spec")
+rpart.auc<- pROC::auc(setB2$group, rpart.perf[,2])
+rpart.aucCI<- pROC::ci.auc(setB2$group, rpart.perf[,2])
+par(mfrow=c(1,2))
+plot(rpart.perfs, main = paste("AUC:", round(rpart.auc,2)))
+plot(rpart.sens)
+rpart.aucCI
+```
+
+## LASSO 
+
+```{r}
+LASSO.probs.min <- predict(LASSO.min, newdata=val.LASSO[-1], type = "prob")
+LASSO.pred.min<- prediction(LASSO.probs.min$PH, val.LASSO$group)
+LASSO.perfs.min<- ROCR::performance(LASSO.pred.min,"tpr","fpr")
+LASSO.sens.min<- ROCR::performance(LASSO.pred.min,"sens","spec")
+LASSO.auc.min<- pROC::auc(val.LASSO$group, LASSO.probs.min[,2])
+LASSO.aucCI<- pROC::ci.auc(val.LASSO$group, LASSO.probs.min[,2])
+par(mfrow=c(1,2))
+plot(LASSO.perfs.min, main = paste("AUC:", round(LASSO.auc.min,2)))
+plot(LASSO.sens.min)
+LASSO.aucCI
+```
+
+## XGBoost
+
+```{r}
+xgbpreds<- predict(xgb_tune_final_short, validation.short, type = "prob")
+xgb.pred<- prediction(xgbpreds$PH, as.factor(setBshort$group))
+xgb.perfs<- ROCR::performance(xgb.pred,"tpr","fpr")
+xgb.sens<- ROCR::performance(xgb.pred,"sens","spec")
+xgb.auc<- pROC::auc(as.factor(setBshort$group), xgbpreds[,2])
+xgb.aucCI<- pROC::ci.auc(as.factor(setBshort$group), xgbpreds[,2])
+par(mfrow=c(1,2))
+plot(xgb.perfs, main = paste("AUC:", round(xgb.auc,2)))
+plot(xgb.sens)
+xgb.aucCI
+```
+
+```{r}
+plot(xgb.perfs, col = "blue", lwd = 2.5, cex = 2)
+plot(LASSO.perfs.min, col = "light blue", add = TRUE, lwd = 2.5)
+plot(rpart.perfs, col = "dark blue", add = TRUE, lwd = 2.5)
+plot(Boruta.perfs, col = "turquoise", add = TRUE, lwd = 2.5)
+abline(0,1, lty= 2, lwd = 2)
+legend("bottomright", legend = c("XGBoost", "LASSO", "Rpart", "Random Forest"), col = c("blue", "light blue", "dark blue", "turquoise"), lty = 1, inset = 0.1, lwd = 2.5)
+```
+
+# Selected miRs
+
+```{r}
+kable(multi.boruta.mirs, col.names = paste("Boruta miRs: (",length(multi.boruta.mirs),")"))
+kable(as.character(rpartmirs), col.names = paste("Rpart miRs: (",length(rpartmirs),")"))
+kable(lasso.model$rowname[-1], col.names = paste("LASSO miRs: (", length(lasso.model$rowname[-1]),")"))
+kable(xgb_mirs$Feature, col.names = paste("XGBoost miRs: (",length(xgb_mirs$Feature),")"))
+paste("Unique miRs:", length(unique(c(multi.boruta.mirs, rpartmirs, lasso.model$rowname[-1], xgb_mirs$Feature))))
+```
+
+```{r}
+library(VennDiagram)
+v1<- venn.diagram(x=list(A= as.vector(lasso.model$rowname),B=as.vector(rpartmirs),C=as.vector(multi.boruta.mirs), D=as.vector(xgb_mirs$Feature)), category = c("LASSO miRs","Rpart miRs","Random forest miRs","XGBoost miRs"), fill = c("skyblue","pink1","mediumorchid","dark blue"), lty = "blank", fontfamily = "sans", cat.fontfamily = "sans", filename=NULL, simplify=TRUE, cex = 1.3, cat.cex = 1.3)
+grid.newpage()
+grid.draw(v1)
+
+```
+
+# Ensemble approach
+
+```{r}
+totalprobs<- data.frame(patientID = rownames(Boruta.perf), group = setB$group, RandomForest = Boruta.perf$PH, rpart = rpart.perf$PH, LASSO = LASSO.probs.min$PH, XGB = xgbpreds$PH)
+totalprobs <- mutate(totalprobs, Mean = rowMeans(totalprobs[3:6]))
+totalprobs$EnsemblePreds <- ifelse(totalprobs$Mean > 0.5, "PH", "HV")
+Ensemble.pred<-prediction(totalprobs$Mean, totalprobs$group) 
+Ensemble.perfs<- ROCR::performance(Ensemble.pred, "tpr", "fpr")
+kable(totalprobs)  %>% kable_styling(full_width = TRUE)
+```
+
+```{r}
+pROC::auc(totalprobs$group, totalprobs$Mean)
+pROC::ci.auc(totalprobs$group, totalprobs$Mean)
+table(totalprobs$EnsemblePreds, totalprobs$group)
+```
+
+
+# Variable Importance 
+
+```{r}
+RFvars<-varImp(fit.Boruta)[[1]]%>% rownames_to_column() %>% select(miR = rowname, RFIMP = Overall)
+rpartvars<- varImp(fit.caret.rpart)[[1]] %>% filter(Overall > 0) %>% rownames_to_column() %>% select(miR = rowname, rpartIMP = Overall)
+LASSOvars<- varImp(LASSO.min)[[1]]  %>% filter(Overall > 0)%>% rownames_to_column() %>% select(miR = rowname, LASSOIMP = Overall)
+XGBvars<- varImp(xgb_tune_final_short)[[1]]%>% rownames_to_column() %>% select(miR = rowname, XGBIMP = Overall)
+n<- max(dim(RFvars)[1], dim(rpartvars)[1], dim(LASSOvars)[1], dim(XGBvars)[1])
+allimps <- dplyr::full_join(x = RFvars, y=  rpartvars) %>% full_join(x=., y=LASSOvars) %>% full_join(x=., XGBvars)
+
+plot(varImp(fit.Boruta))
+plot(varImp(fit.caret.rpart))
+plot(varImp(LASSO.min))
+plot(varImp(xgb_tune_final_short))
+```
+
+```{r}
+reshaped<- melt(allimps, id.vars = 1)
+ggplot(reshaped, aes(x=miR, y = value)) + geom_bar(aes(fill=variable),stat="identity",position="dodge")  + theme(axis.text.x=element_text(angle=90, vjust=0.5, size = 12), panel.background = element_blank(), panel.grid = element_line(colour="grey")) + labs(x="", y="Importance", size=12) + scale_fill_brewer(palette = "RdYlBu") 
+
+ggplot(reshaped, aes(x=miR, y = value)) + geom_bar(aes(fill=variable),stat="identity")  + theme(axis.text.x=element_text(angle=90, vjust=0.5, size = 12), panel.background = element_blank(), panel.grid = element_line(colour="grey")) + labs(x="", y="Importance", size=12) +  scale_fill_manual(name = "", labels = c("Random Forest", "rpart", "LASSO", "XGBoost"), values = c("dark red", "tomato2", "midnight blue", "cornflowerblue"))
+```
+
+# Mean centered data (Figures 2 and 4)
+
+Figure includes training and validation set.
+
+```{r}
+#melt dataframe into SSc, SSc-no-ph, IPAH, HV
+mormirs <- c("group",mirnames)
+
+#reduce dataset to contain only mirs in selectedmirs
+moremirs<- dataset[,mormirs]
+
+#Mean centre data:
+centre_colmeans <- function(x) {
+    xcentre = colMeans(x)
+    x - rep(xcentre, rep.int(nrow(x), ncol(x)))
+}
+
+meanc<- centre_colmeans(moremirs[-1])
+meanc$group <- moremirs$group
+meanc.melt<- melt(meanc, id.var = "group")
+
+ggplot(data = meanc.melt, aes(x= variable, y=value)) + geom_boxplot(aes(fill=group)) + theme(axis.text.x=element_text(angle=90, vjust=0.5, size = 12),axis.text.y=element_text(size = 12),axis.title.y=element_text(size=12), panel.background = element_rect(fill = 'white'), axis.line = element_line(colour = 'black')) + labs(x="", y="Mean centered expression") + scale_colour_manual(values = c("Dark Blue", "Light Blue")) + scale_fill_manual(values = c("Dark Blue", "Light Blue")) 
+```
+
+```{r}
+mirheat<- data.frame(Boruta = all.mirs, Rpart = all.mirs, LASSO = all.mirs, XGBoost = all.mirs, stringsAsFactors = FALSE)
+rownames(mirheat)<- all.mirs
+
+mirheat$Boruta <- ifelse(mirheat$Boruta %in% multi.boruta.mirs, "miR selected", "miR not selected")
+mirheat$Rpart<- ifelse(mirheat$Rpart %in% as.character(rpartmirs),"miR selected", "miR not selected")
+mirheat$LASSO <- ifelse(mirheat$LASSO %in% lasso.model$rowname[-1], "miR selected", "miR not selected")
+mirheat$XGBoost <- ifelse(mirheat$XGBoost %in% xgb_mirs$Feature,"miR selected", "miR not selected")
+
+library(pheatmap)
+
+colors <- colorRampPalette(brewer.pal(9, "Blues"))(255)
+my_colour = list(
+    XGBoost = c(`miR selected` = "midnightblue", `miR not selected`= "cornsilk1"),
+    LASSO = c(`miR selected` = "midnightblue", `miR not selected`= "cornsilk1"),
+    Rpart = c(`miR selected` = "midnightblue", `miR not selected`= "cornsilk1"),
+    Boruta = c(`miR selected` = "midnightblue", `miR not selected`= "cornsilk1")
+)
+
+forheatmap<- dataset[,colnames(dataset) %in% all.mirs]
+sampleDists<- cor(forheatmap, method = "spearman")
+sampleDists<- abs(sampleDists)
+sampleDistsM<- as.matrix(sampleDists)
+pheatmap(sampleDistsM, annotation_row = mirheat, col = colors, annotation_colors = my_colour, clustering_method = "average")
+```
+
+
+# With NTproBNP
+
+Classification of patients based on:
+
+Normal <125 pg/ml in under 75's
+
+Normal <450 pg/ml in over 75's
+
+```{r}
+library(readxl)
+ NTproBNP <- as.data.frame(read_excel("~/Google Drive File Stream/My Drive/miRNA/NTproBNP.xlsx"))
+rownames(NTproBNP)<- NTproBNP$filename
+table(NTproBNP[,6:7])
+```
+
+```{r}
+dataset$filename <- rownames(dataset)
+withBNP<- dplyr::left_join(dataset, NTproBNP, by = "filename")
+rownames(withBNP)<- withBNP$filename
+withBNP<- dplyr::select(withBNP, -biobankid, -uid, -filename, -Status, -Predicted, -PHstatus, -Normal.range) 
+withBNPa<- withBNP[withBNP$AB == "A",] %>% select(-AB) %>% filter(NTproBNP > 0)
+withBNPb<- withBNP[withBNP$AB == "B",]%>% select(-AB) %>% filter(NTproBNP > 0)
+
+```
+
+
+# Logistic regression NTproBNP
+
+```{r, message = FALSE}
+withBNPa$group <- as.factor(withBNPa$group)
+proBNP<- glm(group ~ NTproBNP, data = withBNPa, family = "binomial")
+summary(proBNP)
+
+withBNPb$group<- as.factor(withBNPb$group)
+NTproBNPprob<- predict(proBNP, newdata = withBNPb, type = "response")
+NTproBNPpred<- rep("HV", dim(withBNPb)[1])
+NTproBNPpred[NTproBNPprob > 0.5] = "PH"
+NTproBNPpred<- as.factor(NTproBNPpred)
+confusionMatrix(NTproBNPpred,withBNPb$group, positive = "PH")
+
+pred.BNP<- prediction(NTproBNPprob, as.factor(withBNPb$group), label.ordering = c("HV","PH"))
+perfs.BNP<- ROCR::performance(pred.BNP,"tpr","fpr")
+sens.BNP<- ROCR::performance(pred.BNP,"sens","spec")
+auc.BNP<- pROC::auc(as.factor(withBNPb$group), NTproBNPprob)
+aucCI.BNP<- pROC::ci.auc(as.factor(withBNPb$group), NTproBNPprob)
+aucCI.BNP
+par(mfrow=c(1,2))
+plot(perfs.BNP, main = paste("AUC:", round(auc.BNP,2)))
+plot(sens.BNP)
+```
+
+
+# Re run models with NTproBNP
+
+Add NTproBNP to existing models, using continuous NTproBNP
+
+## Boruta
+
+```{r}
+m2<- paste(m, "+", "NTproBNP")
+RFm2<- as.formula(paste("group ~ ",m2,sep = ""))
+Boruta.data2<- withBNPa[,c("group",multi.boruta.mirs, "NTproBNP")]
+tree.Boruta2<- withBNPb[,c("group", multi.boruta.mirs, "NTproBNP")]
+```
+
+```{r}
+tunegrid <- expand.grid(.mtry=1)
+control<- trainControl(method = 'repeatedcv',
+                       number = 10,
+                       repeats = 10,
+                       savePredictions = TRUE,
+                       classProbs = TRUE)
+fit.Boruta2 <- caret::train(RFm2, data=Boruta.data2, method="rf", metric="Accuracy", tuneGrid=tunegrid, trControl=control, ntree=ntree)
+RFBoruta.train2 <- predict(fit.Boruta2, tree.Boruta2)
+confusionMatrix(as.factor(RFBoruta.train2), tree.Boruta2$group, positive = "PH")
+```
+
+## Rpart
+
+
+```{r}
+rpartBNPdata<- withBNPa[,colnames(withBNPa) %in% c("group", rpartmirs, "NTproBNP")]
+tc <- trainControl(method="repeatedcv", number=10, repeats = 10, classProbs=TRUE, summaryFunction = twoClassSummary, savePredictions = TRUE)
+
+	set.seed(100)
+fit.caret.rpart2 <- caret::train(group ~ ., data=rpartBNPdata, method='rpart', metric="ROC", trControl=tc, control=rpart.control(minsplit=2, minbucket=3, surrogatestyle = 1, maxcompete = 0)) 
+fit.caret.rpart2$bestTune
+```
+
+```{r}
+prp(fit.caret.rpart2$finalModel, main="PH from HV Rpart model", extra=2, varlen=0)
+plot(as.party(fit.caret.rpart2$finalModel), main="PH from HV Rpart model", drop_terminal=F)
+```
+
+```{r}
+predrpart2 <- predict(fit.caret.rpart2, withBNPb)
+predrpart2<- as.character(predrpart2)
+confusionMatrix(as.factor(predrpart2), withBNPb$group, positive = "PH")
+```
+
+## LASSO
+
+```{r}
+newLASSO <- withBNPa[, colnames(withBNPa) %in% c(colnames(ml.Spear.LASSO), "NTproBNP")]
+tuneLASSO<- expand.grid(.alpha = 1, .lambda = fit.glmcv$lambda.min)
+LASSO.min2<- caret::train(group ~ ., data = newLASSO, method = "glmnet", trControl = control, family = 'binomial', tuneGrid = tuneLASSO)
+lasso.model2<- coef(LASSO.min2$finalModel, LASSO.min2$bestTune$lambda) %>% as.matrix() %>% as.data.frame() %>% rownames_to_column %>% filter(abs(`1`) >0)
+
+```
+
+```{r}
+val.LASSO2<- withBNPb[, colnames(withBNPb) %in% colnames(newLASSO)]
+LASSO.pred.min2 <- predict(LASSO.min2, newdata=val.LASSO2[-1])
+predicted.classes<-as.character(LASSO.pred.min2)
+confusionMatrix(LASSO.pred.min2,val.LASSO2$group, positive = "PH")
+```
+
+
+
+## XGBoost
+
+
+```{r}
+train2<- withBNPa[, colnames(withBNPa) %in% c(colnames(train.short), "NTproBNP")]
+train2<- data.matrix(train2)
+validation2<- withBNPb[, colnames(withBNPb) %in% c(colnames(train.short), "NTproBNP")]
+validation2<- data.matrix(validation2)
+
+labels<- withBNPa$group
+labelsB <- withBNPb$group
+
+set.seed(25)
+xgb_tune_final_short2 <- caret::train(
+  x = train2,
+  y = as.factor(labels),
+  trControl = tune_control,
+  tuneGrid = final_grid_short,
+  method = "xgbTree",
+  verbose = TRUE
+)
+
+xgbpredictfinalshort2<- predict(xgb_tune_final_short2, validation2)
+confusionMatrix(xgbpredictfinalshort2, as.factor(labelsB), positive = "PH")
+```
+
+
+# ROC on interim set for models including NTproBNP
+
+## Boruta
+
+```{r, message=FALSE}
+Boruta.perf2<- predict(fit.Boruta2, tree.Boruta2[-1], type= "prob")
+Boruta.pred2<- prediction(Boruta.perf2$PH, tree.Boruta2$group)
+Boruta.perfs2<- ROCR::performance(Boruta.pred2,"tpr","fpr")
+Boruta.sens2<- ROCR::performance(Boruta.pred2,"sens","spec")
+Boruta.auc2<- pROC::auc(tree.Boruta2$group, Boruta.perf2[,2])
+Boruta.aucCI2<- pROC::ci.auc(tree.Boruta2$group, Boruta.perf2[,2])
+par(mfrow=c(1,2))
+plot(Boruta.perfs2, main = paste("AUC:", round(Boruta.auc2,2)))
+plot(Boruta.sens2)
+Boruta.aucCI2
+```
+
+## Rpart
+
+```{r, message=FALSE}
+rpart.perf2<- predict(fit.caret.rpart2, withBNPb[-1], type= "prob")
+rpart.pred2<- prediction(rpart.perf2$PH, withBNPb$group)
+rpart.perfs2<- ROCR::performance(rpart.pred2,"tpr","fpr")
+rpart.sens2<- ROCR::performance(rpart.pred2,"sens","spec")
+rpart.auc2<- pROC::auc(withBNPb$group, rpart.perf2[,2])
+rpart.aucCI2<- pROC::ci.auc(withBNPb$group, rpart.perf2[,2])
+par(mfrow=c(1,2))
+plot(rpart.perfs2, main = paste("AUC:", round(rpart.auc2,2)))
+plot(rpart.sens2)
+rpart.aucCI2
+```
+
+## LASSO 
+
+```{r, message=FALSE}
+LASSO.probs.min2 <- predict(LASSO.min2, newdata=withBNPb[-1], type = "prob")
+LASSO.pred.min2<- prediction(LASSO.probs.min2$PH, withBNPb$group)
+LASSO.perfs.min2<- ROCR::performance(LASSO.pred.min2,"tpr","fpr")
+LASSO.sens.min2<- ROCR::performance(LASSO.pred.min2,"sens","spec")
+LASSO.auc.min2<- pROC::auc(withBNPb$group, LASSO.probs.min2[,2])
+LASSO.aucCI2<- pROC::ci.auc(withBNPb$group, LASSO.probs.min2[,2])
+par(mfrow=c(1,2))
+plot(LASSO.perfs.min2, main = paste("AUC:", round(LASSO.auc.min2,2)))
+plot(LASSO.sens.min2)
+LASSO.aucCI2
+```
+
+## XGboost
+
+```{r, message=FALSE}
+xgbpreds2<- predict(xgb_tune_final_short2, validation2, type = "prob")
+xgb.pred2<- prediction(xgbpreds2$PH, as.factor(labelsB))
+xgb.perfs2<- ROCR::performance(xgb.pred2,"tpr","fpr")
+xgb.sens2<- ROCR::performance(xgb.pred2,"sens","spec")
+xgb.auc2<- pROC::auc(as.factor(labelsB), xgbpreds2[,2])
+xgb.aucCI2<- pROC::ci.auc(as.factor(labelsB), xgbpreds2[,2])
+par(mfrow=c(1,2))
+plot(xgb.perfs2, main = paste("AUC:", round(xgb.auc2,2)))
+plot(xgb.sens2)
+```
+
+## Ensemble
+
+```{r}
+totalprobs2<- data.frame(patientID = rownames(Boruta.perf2), group = tree.Boruta2$group, RandomForest = Boruta.perf2$PH, rpart = rpart.perf2$PH, LASSO = LASSO.probs.min2$PH, XGB = xgbpreds2$PH)
+totalprobs2 <- mutate(totalprobs2, Mean = rowMeans(totalprobs2[3:6]))
+totalprobs2$EnsemblePreds2 <- ifelse(totalprobs2$Mean > 0.5, "PH", "HV")
+Ensemble.pred2<-prediction(totalprobs2$Mean, totalprobs2$group) 
+Ensemble.perfs2<- ROCR::performance(Ensemble.pred2, "tpr", "fpr")
+kable(totalprobs2)  %>% kable_styling(full_width = TRUE)
+```
+
+```{r, message=FALSE}
+pROC::auc(totalprobs2$group, totalprobs2$Mean)
+pROC::ci.auc(totalprobs2$group, totalprobs2$Mean)
+table(totalprobs2$EnsemblePreds2, totalprobs2$group)
+```
+
+## Figure 3
+
+Dashed line models include NTproBNP
+
+```{r}
+layout(mat = matrix(c(1,1,2,2,3,3,4,4,5,5,6,6,7,7,7,7), nrow = 2, byrow = TRUE))
+#layout.show(n = 5)
+plot(xgb.perfs, col = "dark blue", lty = 1, main = "XGBoost", cex.lab = 1.3, cex.main = 1.5)
+plot(xgb.perfs2, col = "dark blue", lty = 2, add = TRUE, cex.lab = 2, cex.main = 1.5)
+plot(LASSO.perfs.min, col = "dark blue", lty = 1, main = "LASSO", cex.lab = 1.3, cex.main = 1.5)
+plot(LASSO.perfs.min2, col = "dark blue", lty = 2, add = TRUE, cex.lab = 1.3, cex.main = 1.5)
+plot(rpart.perfs, col = "dark blue", lty = 1, main = "Rpart", cex.lab = 1.3, cex.main = 1.5)
+plot(rpart.perfs2, col = "dark blue", lty = 2, add = TRUE, cex.lab = 1.3, cex.main = 1.5)
+plot(Boruta.perfs, col = "dark blue", lty = 1, main = "Random Forest", cex.lab = 1.3, cex.main = 1.5)
+plot(Boruta.perfs2, col = "dark blue", lty = 2, add = TRUE, cex.lab = 1.3, cex.main = 1.5)
+plot(Ensemble.perfs, col = "dark blue", lty = 1, main = "Ensemble", cex.lab = 1.3, cex.main = 1.5)
+plot(Ensemble.perfs2, col = "dark blue", lty = 2, add = TRUE, cex.lab = 1.3, cex.main = 1.5)
+plot(perfs.BNP, main = "NTproBNP", cex.lab = 1.3, cex.main = 1.5, col = "dark blue", lty = 2)
+plot(NULL ,xaxt='n',yaxt='n',bty='n',ylab='',xlab='', xlim=0:1, ylim=0:1)
+legend("center", legend = c("base model (n = 32)", "with NTproBNP (n = 24)"), lty = c(1,2), cex = 1.3, bty = "n") 
+
+```
+
+# Cross Validations on training set
+
+```{r}
+separatesplittoconfusion<- function(newlist, splits, d) {
+  newlist[[d]]<- confusionMatrix(splits[[d]]$pred, splits[[d]]$obs, positive = "PH")
+}
+confusionaccuracy<- function(x){
+  (x$table[1]+x$table[4])/(x$table[1]+x$table[2]+x$table[3]+x$table[4])
+}
+confusionsensitivity<- function(x){
+   x$table[1]/(x$table[1]+x$table[2])
+}
+confusionspecificity<- function(x){
+ (x$table[4]/(x$table[3]+x$table[4]))
+}
+confusionPPV<- function(x){
+ (x$table[1]/(x$table[1]+x$table[3]))
+}
+confusionNPV<- function(x){
+  (x$table[4]/(x$table[2]+x$table[4]))
+}
+```
+
+## Random Forest
+
+```{r}
+borutaconfusions<- list()
+borutaconfusions<- lapply(1:100, separatesplittoconfusion, newlist = borutaconfusions, splits = boruta.split)
+
+cvborutaaccuracy<- unlist(lapply(borutaconfusions, confusionaccuracy))
+cvborutasensitivity<- unlist(lapply(borutaconfusions, confusionsensitivity))
+cvborutaspecificity<- unlist(lapply(borutaconfusions, confusionspecificity))
+cvborutaPPV <- unlist(lapply(borutaconfusions, confusionPPV))
+cvborutaNPV<- unlist(lapply(borutaconfusions, confusionNPV))
+summary(cvborutaaccuracy)
+summary(cvborutasensitivity)
+summary(cvborutaspecificity)
+summary(cvborutaPPV)
+summary(cvborutaNPV)
+```
+
+## rpart
+
+```{r}
+rpartconfusions<- list()
+rpartconfusions<- lapply(1:100, separatesplittoconfusion, newlist = rpartconfusions, splits = rpart.split)
+cvrpartaccuracy<- unlist(lapply(rpartconfusions, confusionaccuracy))
+cvrpartsensitivity<- unlist(lapply(rpartconfusions, confusionsensitivity))
+cvrpartspecificity<- unlist(lapply(rpartconfusions, confusionspecificity))
+cvrpartPPV <- unlist(lapply(rpartconfusions, confusionPPV))
+cvrpartNPV<- unlist(lapply(rpartconfusions, confusionNPV))
+summary(cvrpartaccuracy)
+summary(cvrpartsensitivity)
+summary(cvrpartspecificity)
+summary(cvrpartPPV)
+summary(cvrpartNPV)
+```
+
+## LASSO
+
+```{r}
+LASSOconfusions<- list()
+LASSOconfusions<- lapply(1:100, separatesplittoconfusion, newlist = LASSOconfusions, splits = LASSO.split.min)
+cvLASSOaccuracy<- unlist(lapply(LASSOconfusions, confusionaccuracy))
+cvLASSOsensitivity<- unlist(lapply(LASSOconfusions, confusionsensitivity))
+cvLASSOspecificity<- unlist(lapply(LASSOconfusions, confusionspecificity))
+cvLASSOPPV <- unlist(lapply(LASSOconfusions, confusionPPV))
+cvLASSONPV<- unlist(lapply(LASSOconfusions, confusionNPV))
+summary(cvLASSOaccuracy)
+summary(cvLASSOsensitivity)
+summary(cvLASSOspecificity)
+summary(cvLASSOPPV)
+summary(cvLASSONPV)
+```
+
+## XGBoost
+
+```{r}
+XGBconfusions<- list()
+XGBconfusions<- lapply(1:100, separatesplittoconfusion, newlist = XGBconfusions, splits = XGB.split)
+cvXGBaccuracy<- unlist(lapply(XGBconfusions, confusionaccuracy))
+cvXGBsensitivity<- unlist(lapply(XGBconfusions, confusionsensitivity))
+cvXGBspecificity<- unlist(lapply(XGBconfusions, confusionspecificity))
+cvXGBPPV <- unlist(lapply(XGBconfusions, confusionPPV))
+cvXGBNPV<- unlist(lapply(XGBconfusions, confusionNPV))
+summary(cvXGBaccuracy)
+summary(cvXGBsensitivity)
+summary(cvXGBspecificity)
+summary(cvXGBPPV)
+summary(cvXGBNPV)
+```
+
+
+# ROC tests
+
+```{r, message = FALSE}
+roc.out_NTproBNP<- roc(as.factor(withBNPb$group), NTproBNPprob)
+roc.out_XGB_NTproBNP<- roc(as.factor(labelsB), xgbpreds2[,2])
+roc.out_RF_NTproBNP <- roc(tree.Boruta2$group, Boruta.perf2[,2])
+roc.out_rpart_NTproBNP <- roc(withBNPb$group, rpart.perf2[,2])
+roc.out_LASSO_NTproBNP <- roc(withBNPb$group, LASSO.probs.min2[,2])
+
+roc.out_rpart <- roc(setB2$group, rpart.perf[,2])
+roc.out_LASSO <- roc(val.LASSO$group, LASSO.probs.min[,2])
+roc.out_XGB <- roc(as.factor(setBshort$group), xgbpreds[,2])
+roc.out_RF <- roc(tree.Boruta$group, Boruta.perf[,2])
+
+roc.test(roc.out_RF, roc.out_RF_NTproBNP, paired = FALSE)
+roc.test(roc.out_rpart, roc.out_rpart_NTproBNP, paired = FALSE)
+roc.test(roc.out_LASSO, roc.out_LASSO_NTproBNP, paired = FALSE)
+roc.test(roc.out_XGB, roc.out_XGB_NTproBNP, paired = FALSE)
+
+roc.test(roc.out_NTproBNP, roc.out_RF_NTproBNP, paired = FALSE)
+roc.test(roc.out_NTproBNP, roc.out_rpart_NTproBNP, paired = FALSE)
+roc.test(roc.out_NTproBNP, roc.out_LASSO_NTproBNP, paired = FALSE)
+roc.test(roc.out_NTproBNP, roc.out_XGB_NTproBNP, paired = FALSE)
+```
+
+
+
+
+# Validation gender split AUC
+
+```{r}
+male<- filter(pheno, Gender == "Male" & AorB == "B") %>% select(filename) %>% as.list(.)
+female<- filter(pheno, Gender == "Female" & AorB == "B") %>% select(filename) 
+
+Male<- setB[rownames(setB) %in% male[[1]],]
+Female<- setB[rownames(setB) %in% female[[1]],]
+```
+
+### Random Forest
+
+```{r, message=FALSE}
+RFBoruta.trainM <- predict(fit.Boruta, Male)
+BorutaInterimM<- confusionMatrix(as.factor(RFBoruta.trainM), as.factor(Male$group), positive = "PH")
+BorutaInterimM
+RF.perfM<- predict(fit.Boruta, Male[-1], type= "prob")
+RF.aucM<- pROC::auc(Male$group, RF.perfM[,2])
+RF.aucCIM<- pROC::ci.auc(Male$group, RF.perfM[,2])
+RF.aucM
+RF.aucCIM
+
+```
+
+```{r}
+RFBoruta.trainF <- predict(fit.Boruta, Female)
+BorutaInterimF<- confusionMatrix(as.factor(RFBoruta.trainF), as.factor(Female$group), positive = "PH")
+BorutaInterimF
+RF.perfF<- predict(fit.Boruta, Female[-1], type= "prob")
+RF.aucF<- pROC::auc(Female$group, RF.perfF[,2])
+RF.aucCIF<- pROC::ci.auc(Female$group, RF.perfF[,2])
+RF.aucF
+RF.aucCIF
+
+```
+
+### rpart
+
+```{r, message=FALSE}
+predrpartM <- predict(fit.caret.rpart, Male)
+confusionMatrix(Male$group, predrpartM)
+rpart.perfM<- predict(fit.caret.rpart, Male[-1], type= "prob")
+rpart.aucM<- pROC::auc(Male$group, rpart.perfM[,2])
+rpart.aucCIM<- pROC::ci.auc(Male$group, rpart.perfM[,2])
+rpart.aucM
+rpart.aucCIM
+```
+```{r, message=FALSE}
+predrpartF <- predict(fit.caret.rpart, Female)
+confusionMatrix(Female$group, predrpartF, positive = "PH")
+rpart.perfF<- predict(fit.caret.rpart, Female[-1], type= "prob")
+rpart.aucF<- pROC::auc(Female$group, rpart.perfF[,2])
+rpart.aucCIF<- pROC::ci.auc(Female$group, rpart.perfF[,2])
+rpart.aucF
+rpart.aucCIF
+```
+
+### LASSO
+```{r, message=FALSE}
+LASSO.pred.minM <- predict(LASSO.min, newdata=Male[-1])
+LASSOInterimM<- confusionMatrix(LASSO.pred.minM, Male$group, positive = "PH")
+LASSOInterimM
+LASSO.perfM<- predict(LASSO.min, Male[-1], type= "prob")
+LASSO.aucM<- pROC::auc(Male$group, LASSO.perfM[,2])
+LASSO.aucCIM<- pROC::ci.auc(Male$group, LASSO.perfM[,2])
+LASSO.aucM
+LASSO.aucCIM
+```
+
+```{r, message = FALSE}
+LASSO.pred.minF <- predict(LASSO.min, newdata=Female[-1])
+LASSOInterimF<- confusionMatrix(LASSO.pred.minF, Female$group, positive = "PH")
+LASSOInterimF
+LASSO.perfF<- predict(LASSO.min, Female[-1], type= "prob")
+LASSO.aucF<- pROC::auc(Female$group, LASSO.perfF[,2])
+LASSO.aucCIF<- pROC::ci.auc(Female$group, LASSO.perfF[,2])
+LASSO.aucF
+LASSO.aucCIF
+```
+
+### XGBoost
+
+```{r, message=FALSE}
+xgbpredictfinalshortM<- predict(xgb_tune_final_short, Male[,c("group",xgb_mirs$Feature)])
+XGBInterimM<- confusionMatrix(xgbpredictfinalshortM, as.factor(Male$group), positive = "PH")
+XGBInterimM
+XGB.perfM<- predict(xgb_tune_final_short, Male[,c("group",xgb_mirs$Feature)], type= "prob")
+XGB.aucM<- pROC::auc(Male$group, XGB.perfM[,2])
+XGB.aucCIM<- pROC::ci.auc(Male$group, XGB.perfM[,2])
+XGB.aucM
+XGB.aucCIM
+```
+
+```{r, message=FALSE}
+xgbpredictfinalshortF<- predict(xgb_tune_final_short, Female[,c("group",xgb_mirs$Feature)])
+XGBInterimF<- confusionMatrix(xgbpredictfinalshortF, as.factor(Female$group), positive = "PH")
+XGBInterimF
+XGB.perfF<- predict(xgb_tune_final_short, Female[,c("group",xgb_mirs$Feature)], type= "prob")
+XGB.aucF<- pROC::auc(Female$group, XGB.perfF[,2])
+XGB.aucCIF<- pROC::ci.auc(Female$group, XGB.perfF[,2])
+XGB.aucF
+XGB.aucCIF
+```
+
+
+```{r, include=FALSE}
+#save.image(file = "~/Google Drive File Stream/My Drive/miRNA/ensembleshort.RData") # 24/11/2020
+#when reloading from image file, libraries must be loaded too
+library(pacman)
+p_load("kableExtra","caret","tidyverse","reshape2","e1071","JamesTools","OptimalCutpoints","Boruta","ggplot2","randomForest","ROCR","rpart","party","rpart.plot","partykit","glmnet","xgboost","RColorBrewer", "pheatmap")
+#load("~/Google Drive File Stream/My Drive/miRNA/ensembleshort.RData")
+```
+
+# Model predictions for all samples, training and validation sets
+
+```{r}
+all.Boruta.perf<- predict(fit.Boruta, select(dataset, -group, -PHstatus, -AB, -filename), type= "prob")
+all.rpart.perf<- predict(fit.caret.rpart, select(dataset, -group, -PHstatus, -AB, -filename), type= "prob")
+all.LASSO.probs.min <- predict(LASSO.min, newdata=select(dataset, -group, -PHstatus, -AB, -filename), type = "prob")
+all.xgbpreds<- predict(xgb_tune_final_short, select(dataset, xgb_mirs$Feature, -group, -PHstatus, -AB, -filename), type = "prob")
+
+allprobs<- data.frame(patientID = dataset$filename, group = dataset$group, RandomForest = all.Boruta.perf$PH, rpart = all.rpart.perf$PH, LASSO = all.LASSO.probs.min$PH, XGB = all.xgbpreds$PH)
+allprobs <- mutate(allprobs, Mean = rowMeans(allprobs[3:6]))
+allprobs$EnsemblePreds <- ifelse(allprobs$Mean > 0.5, "PH", "HV")
+#write.csv(allprobs, "~/Google Drive File Stream/My Drive/miRNA/modelpredictions.csv")
+kable(allprobs)  %>% kable_styling(full_width = TRUE)
+```
+
+
+
+
+
+
