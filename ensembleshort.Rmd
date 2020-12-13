@@ -4,6 +4,7 @@ author: "Niamh Errington"
 date: "`r format(Sys.time(), '%d %B %Y')`" 
 output: 
   html_document:
+    keep_md: true
     code_folding: hide
     toc: true
     toc_float: true
@@ -146,7 +147,7 @@ tc <- trainControl(method="repeatedcv", number=10, repeats = 10, classProbs=TRUE
 #maxcompete
 
 set.seed(20)
-fit.caret.rpart <- caret::train(group ~ ., data=ml.Spear, method='rpart', metric="ROC", trControl=tc, control=rpart.control(minsplit=2, minbucket=3, surrogatestyle = 1, maxcompete = )) 
+fit.caret.rpart <- caret::train(group ~ ., data=ml.Spear, method='rpart', metric="ROC", trControl=tc, control=rpart.control(minsplit=2, minbucket=3, surrogatestyle = 1, maxcompete = 0)) 
 fit.caret.rpart$bestTune
 ```
 
@@ -1030,7 +1031,7 @@ meanc<- centre_colmeans(moremirs[-1])
 meanc$group <- moremirs$group
 meanc.melt<- melt(meanc, id.var = "group")
 
-ggplot(data = meanc.melt, aes(x= variable, y=value)) + geom_boxplot(aes(fill=group)) + theme(axis.text.x=element_text(angle=90, vjust=0.5, size = 12),axis.text.y=element_text(size = 12),axis.title.y=element_text(size=12), panel.background = element_rect(fill = 'white'), axis.line = element_line(colour = 'black')) + labs(x="", y="Mean centered expression") + scale_colour_manual(values = c("Dark Blue", "Light Blue")) + scale_fill_manual(values = c("Dark Blue", "Light Blue")) 
+ggplot(data = meanc.melt, aes(x= variable, y=value)) + geom_boxplot(aes(fill=group)) + theme(axis.text.x=element_text(angle=90, vjust=0.5, size = 12),axis.text.y=element_text(size = 12),axis.title.y=element_text(size=12), panel.background = element_rect(fill = 'white'), axis.line = element_line(colour = 'black')) + labs(x="", y="Mean centered expression") + scale_colour_manual(values = c("Dark Blue", "Light Blue")) + scale_fill_manual(values = c("Midnight blue", "cornflowerblue")) 
 ```
 
 ```{r}
@@ -1306,6 +1307,19 @@ plot(NULL ,xaxt='n',yaxt='n',bty='n',ylab='',xlab='', xlim=0:1, ylim=0:1)
 legend("center", legend = c("base model (n = 32)", "with NTproBNP (n = 24)"), lty = c(1,2), cex = 1.3, bty = "n") 
 
 ```
+
+```{r}
+layout(mat = matrix(c(1,1,2,2,3,3,4,4,5,5,6,6), nrow = 2, byrow = TRUE))
+#layout.show(n = 5)
+plot(xgb.perfs, col = "dark blue", lty = 1, main = "XGBoost", cex.lab = 1.3, cex.main = 1.5, lwd = 3)
+plot(LASSO.perfs.min, col = "dark blue", lty = 1, main = "LASSO", cex.lab = 1.3, cex.main = 1.5, lwd = 3)
+plot(rpart.perfs, col = "dark blue", lty = 1, main = "Rpart", cex.lab = 1.3, cex.main = 1.5, lwd = 3)
+plot(Boruta.perfs, col = "dark blue", lty = 1, main = "Random Forest", cex.lab = 1.3, cex.main = 1.5, lwd = 3)
+plot(Ensemble.perfs, col = "dark blue", lty = 1, main = "Ensemble", cex.lab = 1.3, cex.main = 1.5, lwd = 3)
+plot(perfs.BNP, main = "NTproBNP", cex.lab = 1.3, cex.main = 1.5, col = "dark blue", lty = 1, lwd = 3)
+```
+
+
 
 # Cross Validations on training set
 
