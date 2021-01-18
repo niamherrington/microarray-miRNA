@@ -1,19 +1,7 @@
 ---
 title: "IPAH and PH-SSc vs HV and SSc-No-PH"
-author: "Niamh Errington"
-date: "13 December 2020" 
-output: 
-  html_document:
-    keep_md: true
-    code_folding: hide
-    toc: true
-    toc_float: true
-    toc_collapsed: false
----
-
-
-
-
+output: html_notebook
+  ---
 
 ```r
 source('~/Google Drive File Stream//My Drive/Work/Microarrays/2014 miRNA Arrays/Final Analysis/Scripts/Custom functions.R', chdir = TRUE)
