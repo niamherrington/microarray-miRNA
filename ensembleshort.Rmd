@@ -1,14 +1,6 @@
 ---
-title: "IPAH and PH-SSc vs HV and SSc-No-PH"
-author: "Niamh Errington"
-date: "`r format(Sys.time(), '%d %B %Y')`" 
-output: 
-  html_document:
-    keep_md: true
-    code_folding: hide
-    toc: true
-    toc_float: true
-    toc_collapsed: false
+title: "PAH vs Control"
+output: html_notebook
 ---
 
 ```{r setup, include=FALSE}
