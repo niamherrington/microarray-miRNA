@@ -1,0 +1,21 @@
+---
+title: "miRNA selection"
+output: html_document
+---
+
+Heatmap of selected miRNAs using 4 different supervised machine learning approaches across 3 different discovery sets: a) a training and validation cross validation approach for IPAH and PAH-SSc vs healthy controls and PH-without SSc; b)  leave-one-out cross validation approach across the whole dataset for IPAH and PAH-SSc vs healthy controls and PH-without SSc. c) training and validation cross validation approach for patients with IPAH and healthy controls. Blue: miRNA was selected, white: miRNA was not selected.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(readr)
+library(reshape2)
+miRselected <- read_csv("miRselected.csv")
+miRselected[is.na(miRselected)] <- 0
+plotdata<- melt(miRselected, id.vars = "miRNA") %>% mutate(method = str_sub(variable, start = 1, end = -2)  ,group = str_sub(variable, start=-1)) %>% mutate(group = tolower(group))
+ggplot(data = plotdata, aes(x = group, y = miRNA, fill = value)) + geom_tile() + scale_fill_gradient(low = "white", high = "midnightblue") + theme(text = element_text(size=14), legend.position = "none")+ facet_grid(~method)
+```
+
