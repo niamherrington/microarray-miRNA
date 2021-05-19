@@ -1,0 +1,592 @@
+---
+title: "XGBoost on miRNA Targets"
+author: "Niamh Errington"
+date: "`r format(Sys.time(), '%d %B %Y')`" 
+output: 
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    toc_collapsed: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
+library(kableExtra)
+```
+
+IDs overlapping the miRNA dataset removed
+
+
+# Parameters for tuning
+
+`nrounds` - maximum number of iterations (similar to no. of trees grown). 
+
+`eta` - [range: (0,1)] - learning rate. After every round, it shrinks the feature weights to reach the best optimum. Lower eta = slower computation 
+
+`gamma` [range: $(0,\infty)$] - controls regularisation (prevents over-fitting)
+
+`max_depth` [range: $(0,\infty)$] - controls the tree depth. The larger the depth, the more complex the model and the higher the chances of over-fitting. Larger data sets require deeper trees
+
+`min_child_weight` [range: $(0,\infty)$] - In classification, if the leaf node has a minimum sum of instance weight lower than min_child_weight, the tree splitting stops. I.e. it stops potential future interactions to reduce over-fitting
+
+`subsample` [range: (0,1)] - number of samples supplied to a tree
+
+`colsample_bytree` [range: (0,1)] - no. of features (variables) supplied to a tree
+
+# XGBoost model 
+
+Using filtered gene list (using Chris's code to obtain file up-loaded by Sokratis) Using the same groups as Chris (A & B for training, C validation).
+
+XGBoost will reduce the importance for variables which are partially correlated. 
+
+Read in data, filter to just genes targeted by miR-636 and miR-187-5p
+
+```{r}
+library(xgboost)
+library(caret)
+library(ggplot2)
+library(readxl)
+library(tidyverse)
+
+#load pheno, training & validation data sets
+load("~/Google Drive/My Drive/XGBoost/XGBoost.RData")
+
+validation.data<- validation[,-ncol(validation)]
+indx<- sapply(validation.data, is.factor)
+validation.data[indx]<- lapply(validation.data[indx],function(x) as.numeric(as.character(x)))
+validation.data<- data.matrix(validation.data)
+
+training.data<- training[,-ncol(training)]
+indx<- sapply(training.data, is.factor)
+training.data[indx]<- lapply(training.data[indx],function(x) as.numeric(as.character(x)))
+training.data<- data.matrix(training.data)
+dim(training)
+dim(validation)
+```
+
+A good kaggle walk through for using `caret` to train `xgboost` can be found [here](https://www.kaggle.com/pelkoja/visual-xgboost-tuning-with-caret#grid-search-for-hyperparameters).
+
+```{r}
+#Set up XGBoost with default hyperparameters
+grid_default <- expand.grid(
+  nrounds = 100,
+  max_depth = 6,
+  eta = 0.3,
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+set.seed(100)
+train_control <- caret::trainControl(
+  method = "cv",
+  verboseIter = FALSE, 
+  allowParallel = TRUE 
+)
+
+nrounds<- seq(from = 100, to =1000, by = 50)
+
+xgb_base <- caret::train(
+  x = training.data,
+  y = training$diagnosis,
+  trControl = train_control,
+  tuneGrid = grid_default,
+  method = "xgbTree",
+  verbose = TRUE,
+  scale_pos_weight = table(training$diagnosis)[["PAH"]]/table(training$diagnosis)[["HC"]]
+)
+```
+
+```{r}
+#tune using caret
+tune_grid <- expand.grid(
+  nrounds = nrounds,
+  eta = c(0.025, 0.05, 0.1, 0.2, 0.3),
+  max_depth = c(2, 3, 4, 5, 6),
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+set.seed(100)
+tune_control <- caret::trainControl(
+  method = "repeatedcv", # cross-validation
+  number = 10, # with n folds 
+  repeats = 10, # repeat n times
+  #index = createFolds(tr_treated$Id_clean), # fix the folds
+  verboseIter = FALSE, # no training log
+  allowParallel = TRUE, 
+  classProbs = TRUE, # calculate probabilities
+  savePredictions = TRUE
+)
+
+set.seed(100)
+xgb_tune <- caret::train(
+  x = training.data,
+  y = training$diagnosis,
+  trControl = tune_control,
+  tuneGrid = tune_grid,
+  method = "xgbTree",
+  verbose = TRUE,
+  scale_pos_weight = table(training$diagnosis)[["PAH"]]/table(training$diagnosis)[["HC"]]
+)
+
+#function to help plot
+tuneplot <- function(x, probs = .90) {
+  ggplot(x) +
+    coord_cartesian(ylim = c(quantile(x$results$Accuracy, probs = probs), min(x$results$Accuracy))) +
+    theme_bw()
+}
+
+tuneplot(xgb_tune)
+
+```
+
+
+```{r}
+#improve tuning in new grid
+tune_grid2 <- expand.grid(
+  nrounds = nrounds,
+  eta = 0.05,
+  max_depth = c(xgb_tune$bestTune$max_depth -1, xgb_tune$bestTune$max_depth, xgb_tune$bestTune$max_depth +1),
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = c(0.2,0.5,1,2),
+  subsample = 1
+)
+
+set.seed(100)
+xgb_tune2 <- caret::train(
+  x = training.data,
+  y = training$diagnosis,
+  trControl = tune_control,
+  tuneGrid = tune_grid2,
+  method = "xgbTree",
+  verbose = TRUE,
+  scale_pos_weight = table(training$diagnosis)[["PAH"]]/table(training$diagnosis)[["HC"]]
+)
+
+tune_grid3 <- expand.grid(
+  nrounds = nrounds,
+  eta = xgb_tune$bestTune$eta,
+  max_depth = xgb_tune2$bestTune$max_depth,
+  gamma = 0,
+  colsample_bytree = c(0.4, 0.6, 0.8, 1.0),
+  min_child_weight = xgb_tune2$bestTune$min_child_weight,
+  subsample = c(0.5, 0.75, 1.0)
+)
+
+set.seed(100)
+xgb_tune3 <- caret::train(
+  x = training.data,
+  y = training$diagnosis,
+  trControl = tune_control,
+  tuneGrid = tune_grid3,
+  method = "xgbTree",
+  verbose = TRUE,
+  scale_pos_weight = table(training$diagnosis)[["PAH"]]/table(training$diagnosis)[["HC"]]
+)
+
+tune_grid4 <- expand.grid(
+  nrounds = nrounds,
+  eta = xgb_tune$bestTune$eta,
+  max_depth = xgb_tune2$bestTune$max_depth,
+  gamma = c(0,0.05, 0.1, 0.5, 0.7, 0.9, 1),
+  colsample_bytree = xgb_tune3$bestTune$colsample_bytree,
+  min_child_weight = xgb_tune2$bestTune$min_child_weight,
+  subsample = xgb_tune3$bestTune$subsample
+)
+
+set.seed(100)
+xgb_tune4 <- caret::train(
+  x = training.data,
+  y = training$diagnosis,
+  trControl = tune_control,
+  tuneGrid = tune_grid4,
+  method = "xgbTree",
+  verbose = TRUE,
+  scale_pos_weight = table(training$diagnosis)[["PAH"]]/table(training$diagnosis)[["HC"]]
+)
+
+#improve tuning in new grid
+tune_grid5 <- expand.grid(
+  nrounds = seq(from = 100, to = 10000, by = 50),
+  eta = c(0.01,0.025,0.05,0.1),
+  max_depth = xgb_tune2$bestTune$max_depth,
+  gamma = xgb_tune4$bestTune$gamma,
+  colsample_bytree = xgb_tune3$bestTune$colsample_bytree,
+  min_child_weight = xgb_tune2$bestTune$min_child_weight,
+  subsample = xgb_tune3$bestTune$subsample
+)
+
+set.seed(100)
+xgb_tune5 <- caret::train(
+  x = training.data,
+  y = training$diagnosis,
+  trControl = tune_control,
+  tuneGrid = tune_grid5,
+  method = "xgbTree",
+  verbose = TRUE,
+  scale_pos_weight = table(training$diagnosis)[["PAH"]]/table(training$diagnosis)[["HC"]]
+)
+
+#improve tuning in new grid
+final_grid <- expand.grid(
+  nrounds = xgb_tune5$bestTune$nrounds,
+  eta = xgb_tune5$bestTune$eta,
+  max_depth = xgb_tune5$bestTune$max_depth,
+  gamma = xgb_tune5$bestTune$gamma,
+  colsample_bytree = xgb_tune5$bestTune$colsample_bytree,
+  min_child_weight = xgb_tune5$bestTune$min_child_weight,
+  subsample = xgb_tune5$bestTune$subsample
+)
+
+set.seed(100)
+xgb_model <- caret::train(
+  x = training.data,
+  y = training$diagnosis,
+  trControl = tune_control,
+  tuneGrid = final_grid,
+  method = "xgbTree",
+  verbose = TRUE,
+  scale_pos_weight = table(training$diagnosis)[["PAH"]]/table(training$diagnosis)[["HC"]]
+)
+```
+
+```{r}
+tuneplot(xgb_tune)
+tuneplot(xgb_tune2)
+tuneplot(xgb_tune3)
+tuneplot(xgb_tune4)
+tuneplot(xgb_tune5)
+```
+
+```{r}
+kable(xgb_tune$bestTune, caption = "1st tuning, best parameters")%>% kable_styling(full_width = TRUE)
+kable(xgb_tune2$bestTune, caption = "2nd tuning, best parameters")%>% kable_styling(full_width = TRUE)
+kable(xgb_tune3$bestTune, caption = "3rd tuning, best parameters")%>% kable_styling(full_width = TRUE)
+kable(xgb_tune4$bestTune, caption = "4th tuning, best parameters")%>% kable_styling(full_width = TRUE)
+kable(xgb_tune5$bestTune, caption = "5th tuning, best parameters")%>% kable_styling(full_width = TRUE)
+kable(xgb_model$bestTune, caption = "Final Model, best parameters")%>% kable_styling(full_width = TRUE)
+```
+
+## Features
+
+`Gain` is utilsied to classify features - it is the improvement in accuracy brought by a feature to the branches it is on.
+
+`Cover` is the relative quantity of observations with said feature
+
+`Frequency` is a count of the number of times a feature is used in all generated trees
+
+```{r}
+XGBvars<- varImp(xgb_model)[[1]]%>% rownames_to_column() %>% select(Gene = rowname, XGBIMP = Overall) %>% filter(XGBIMP > 0) %>% arrange(desc(XGBIMP))
+XGBvarsall<- varImp(xgb_tune5)[[1]]%>% rownames_to_column() %>% select(Gene = rowname, XGBIMP = Overall) %>% arrange(desc(XGBIMP))
+kable(XGBvars[XGBvars$XGBIMP>0.01,], caption = "Features with gain>0.01")%>% kable_styling(full_width = TRUE)
+XGBtop35<- XGBvars %>% filter(XGBIMP >10)
+
+```
+
+
+ZFP36L2 is in the list of Chris' 156 DEGs
+
+# CV AUC
+
+```{r, warning = FALSE, message=FALSE}
+tosplit<- xgb_model
+XGB.split<- split(tosplit$pred, tosplit$pred$Resample)
+lapply(1:100, function(d) {
+  pROC::auc(pROC::roc(predictor = XGB.split[[d]]$PAH, response = XGB.split[[d]]$obs))[1]
+}) %>% unlist() %>% hist(main = paste("XGBoost model CV mean AUC (mean, median, IQR):", round(mean(.),2), round(median(.),2), round(IQR(.),2)))
+```
+
+
+
+# Interim set ROC
+
+```{r, message = FALSE}
+library(pROC)
+library(ROCR)
+xgbpreds<- predict(xgb_model, validation.data, type = "prob")
+xgb.pred<- prediction(xgbpreds$PAH, validation$diagnosis)
+xgb.perfs<- ROCR::performance(xgb.pred,"tpr","fpr")
+xgb.sens<- ROCR::performance(xgb.pred,"sens","spec")
+xgb.auc<- pROC::auc(validation$diagnosis, xgbpreds[,2])
+xgb.auc.CI<- pROC::ci.auc(validation$diagnosis, xgbpreds[,2])
+xgb.auc.CI
+par(mfrow=c(1,2))
+plot(xgb.perfs, main = paste("AUC XGB model 1:", round(xgb.auc,2)))
+plot(xgb.sens)
+```
+
+# Confusion Matrices 
+
+## Training Set confusion matrix
+
+```{r}
+xtuned.train <- predict(xgb_model, training.data)
+#xtuned_decision<- ifelse(xtuned > 0.5,1,0)
+confusionMatrix(as.factor(xtuned.train),as.factor(training$diagnosis), positive = "PAH")
+```
+
+## Validation Set confusion matrix
+
+```{r}
+xtuned_probs <- predict(xgb_model, validation.data, type = "prob")
+xtuned_table<- data.frame("xgbpreds" = xtuned_probs$PAH, "diagnosis" = validation$diagnosis)
+#kable(xtuned_table)
+xtuned <- predict(xgb_model, validation.data)
+#xtuned_decision<- ifelse(xtuned > 0.5,1,0)
+confusion.original<- confusionMatrix(as.factor(xtuned),as.factor(validation$diagnosis), positive = "PAH")
+confusion.original
+```
+
+## Validation Set using calculated ROC threshold
+
+```{r, warning=F, message=F}
+listofrocs <- lapply(1:100, function(d) {
+  pROC::roc(predictor = XGB.split[[d]]$PAH, response = XGB.split[[d]]$obs)
+}) 
+thresholds<- lapply(1:100, function(d) {
+  pROC::coords(listofrocs[[d]], "best", "threshold") }) %>% unlist()
+thresholdspecs <- data.frame(threshold = double(), specificity = double(), sensitivity = double())
+for(i in 1:100) {
+ thresholdspecs[i,] <- unlist(thresholds[i])
+}
+mean(thresholdspecs$threshold)
+
+xtuned_decision_Thresh<- ifelse(xtuned_table$xgbpreds > mean(thresholdspecs$threshold),'PAH','HC')
+confusionMatrix(as.factor(xtuned_decision_Thresh),as.factor(validation$diagnosis), positive = "PAH")
+```
+
+
+```{r}
+xgb.auc
+xgb.auc.CI
+```
+
+
+
+
+Top 35 Gene by importance
+
+
+```{r}
+library(dplyr)
+XGBtop35<- head(XGBvars, n = 35)
+XGBtop20<- head(XGBvars, n = 20)
+XGBtop15<- head(XGBvars, n = 15)
+XGBtop10<- head(XGBvars, n = 10)
+all <- rbind(training, validation)
+
+all35 <- all[,c("diagnosis", XGBtop35$Gene)]
+all20 <- all[,c("diagnosis", XGBtop20$Gene)]
+all10 <- all[,c("diagnosis", XGBtop10$Gene)]
+all15<- all[,c("diagnosis", XGBtop15$Gene)]
+reshaped35<- reshape2::melt(all35, id.vars = "diagnosis") %>% mutate(diagnosis = factor(diagnosis, ))
+reshaped20<- reshape2::melt(all20, id.vars = "diagnosis") %>% mutate(diagnosis = factor(diagnosis, ))
+reshaped10<- reshape2::melt(all10, id.vars = "diagnosis") %>% mutate(diagnosis = factor(diagnosis, ))
+reshaped10<- reshape2::melt(all15, id.vars = "diagnosis") %>% mutate(diagnosis = factor(diagnosis, ))
+KEGGpathways <- read_excel("~/Google Drive/My Drive/miRNA/KEGGpathways.xlsx", 
+    sheet = "Sheet3")
+
+Pcan <- XGBvarsall[XGBvarsall$Gene %in% KEGGpathways$Cancer,]
+Pcan$Pathway <- "Proteoglycans in cancer"
+Prolactin<- XGBvarsall[XGBvarsall$Gene %in% KEGGpathways$ProlactinSignaling,]
+Prolactin$Pathway <- "Prolactin Signaling"
+RenninS<- XGBvarsall[XGBvarsall$Gene %in% KEGGpathways$RenninSecretion,]
+RenninS$Pathway <- "Rennin Secretion"
+Melan<- XGBvarsall[XGBvarsall$Gene %in% KEGGpathways$Melanogenesis,]
+Melan$Pathway <- "Melanogenesis"
+Forcyto <- rbind(Pcan, Prolactin, RenninS, Melan)
+Forcyto <- left_join(Forcyto, select(GenetargetsinRNAseq, Gene, FC, miR))
+Forcyto
+ggplot(XGBtop20, aes(x=Gene, y = XGBIMP)) + geom_col(fill = "Midnight blue")  + theme(axis.text.x=element_text(angle=90, vjust=0.5, size = 12), panel.background = element_blank(), panel.grid = element_line(colour="grey")) + labs(x="", y="Importance", size=12) 
+
+```
+
+```{r}
+reshaped<- reshape2::melt(all20, id.vars = "diagnosis")
+reshaped$value <- as.numeric(reshaped$value)
+ggplot(reshaped, aes(x=variable, y = log2(value))) + geom_boxplot(aes(fill=diagnosis))  + theme(axis.text.x=element_text(angle=90, vjust=0.5, size = 12), panel.background = element_blank(), panel.grid = element_line(colour="grey")) + labs(x="", y="Mean Centered Gene Expression", size=12) + scale_fill_manual(values = c("Midnight Blue", "cornflowerblue")) 
+
+```
+
+```{r}
+reshaped10<- reshape2::melt(all10, id.vars = "diagnosis")
+reshaped10$value <- as.numeric(reshaped10$value)
+ggplot(reshaped10, aes(x=variable, y = log2(value))) + geom_boxplot(aes(fill=diagnosis))  + theme(axis.text.x=element_text(angle=90, vjust=0.5, size = 12), panel.background = element_blank(), panel.grid = element_line(colour="grey")) + labs(x="", y="Log2 Gene Expression", size=12) + scale_fill_manual(values = c("Midnight Blue", "cornflowerblue")) 
+
+```
+
+```{r}
+#write.csv(XGBvars, "~/Google Drive/My Drive/miRNA/RNAxgbimp.csv")
+```
+
+
+```{r}
+#Mean centre data:
+centre_colmeans <- function(x) {
+    xcentre = colMeans(x)
+    x - rep(xcentre, rep.int(nrow(x), ncol(x)))
+}
+all35n <- data.matrix(all35[-1]) %>% as.data.frame
+meanc35n<- centre_colmeans(all35n)
+meanc35n$diagnosis <- all35$diagnosis
+meanc.melt35<- reshape2::melt(meanc35n, id.var = "diagnosis")
+
+ggplot(data = meanc.melt35, aes(x= variable, y=value)) + geom_boxplot(aes(fill=diagnosis)) + theme(axis.text.x=element_text(angle=90, vjust=0.5, size = 12),axis.text.y=element_text(size = 12),axis.title.y=element_text(size=12), panel.background = element_rect(fill = 'white'), axis.line = element_line(colour = 'black')) + labs(x="", y="Mean centered expression") + scale_colour_manual(values = c("Dark Blue", "Light Blue")) + scale_fill_manual(values = c("Dark Blue", "Light Blue")) 
+
+
+all20n <- data.matrix(all20[-1]) %>% as.data.frame
+meanc20n<- centre_colmeans(all20n)
+meanc20n$diagnosis <- all20$diagnosis
+meanc.melt20<- reshape2::melt(meanc20n, id.var = "diagnosis")
+
+ggplot(data = meanc.melt20, aes(x= variable, y=value)) + geom_boxplot(aes(fill=diagnosis)) + theme(axis.text.x=element_text(angle=90, vjust=0.5, size = 12),axis.text.y=element_text(size = 12),axis.title.y=element_text(size=12), panel.background = element_rect(fill = 'white'), axis.line = element_line(colour = 'black')) + labs(x="", y="Mean centered expression") + scale_colour_manual(values = c("Midnight Blue", "cornflowerblue")) + scale_fill_manual(values = c("Midnight Blue", "cornflowerblue")) 
+
+top20FC <- GenetargetsinRNAseq[GenetargetsinRNAseq$Gene %in% XGBtop20$Gene,] %>% arrange(desc((FC)))
+top20FCplot <- top20FC[-17,]
+ggplot(data = top20FCplot, aes(x = Gene, y= FC)) + geom_col(fill = "Midnight blue") + theme(axis.text.x=element_text(angle=90, vjust=0.5, size = 12), panel.background = element_blank(), panel.grid = element_line(colour="grey")) + labs(x="", y="log2 FC", size=12) 
+```
+
+# Top 15
+```{r}
+ggplot(XGBtop15, aes(x=reorder(Gene, -XGBIMP), y = XGBIMP)) + geom_col(fill = "Midnight blue")  + theme(axis.text.x=element_text(angle=90, vjust=0.5, size = 12), panel.background = element_blank(), panel.grid = element_line(colour="grey")) + labs(x="", y="Importance", size=12) 
+```
+
+
+```{r}
+all15n <- data.matrix(all15[-1]) %>% as.data.frame
+meanc15n<- centre_colmeans(all15n)
+meanc15n$diagnosis <- all15$diagnosis
+meanc.melt15<- reshape2::melt(meanc15n, id.var = "diagnosis")
+
+ggplot(data = meanc.melt15, aes(x= variable, y=value)) + geom_boxplot(aes(fill=diagnosis)) + theme(axis.text.x=element_text(angle=90, vjust=0.5, size = 12),axis.text.y=element_text(size = 12),axis.title.y=element_text(size=12), panel.background = element_rect(fill = 'white'), axis.line = element_line(colour = 'black')) + labs(x="", y="Mean centered expression") + scale_colour_manual(values = c("Midnight Blue", "cornflowerblue")) + scale_fill_manual(values = c("Midnight Blue", "cornflowerblue")) 
+```
+
+```{r, eval = FALSE}
+xtuned_train_probs <- predict(xgb_model, training.data, type = "prob")
+rownames(xtuned_train_probs) <- rownames(training.data)
+xtuned_train_probs$diagnosis <- training$diagnosis
+rownames(xtuned_probs) <- rownames(validation.data)
+xtuned_probs$diagnosis <- validation$diagnosis
+full <- rbind(xtuned_train_probs, xtuned_probs)
+full$SampleID <- rownames(full)
+grps <- targetmat
+grps$SampleID <- rownames(grps)
+All <- left_join(select(full, SampleID, diagnosis, PAH), select(targetmat, Random.group))
+#write.csv(All, "~/Google Drive/My Drive/miRNA/XGBpreds.csv")
+```
+
+```{r, eval = F}
+#requires file from RNAoverlap 
+pROC::roc(predictor = XGBoverlap$XGBpred, response = XGBoverlap$diagnosis)
+pROC::roc(predictor = XGBnooverlap$XGBpred, response = XGBnooverlap$diagnosis)
+
+pROC::ci.auc(predictor = XGBoverlap$XGBpred, response = XGBoverlap$diagnosis)
+pROC::ci.auc(predictor = XGBnooverlap$XGBpred, response = XGBnooverlap$diagnosis)
+```
+
+## Validation Set using calculated ROC threshold
+
+```{r, warning=F, message=F}
+listofrocs <- lapply(1:100, function(d) {
+  pROC::roc(predictor = XGB.split[[d]]$PAH, response = XGB.split[[d]]$obs)
+}) 
+thresholds<- lapply(1:100, function(d) {
+  pROC::coords(listofrocs[[d]], "best", "threshold") }) %>% unlist()
+thresholdspecs <- data.frame(threshold = double(), specificity = double(), sensitivity = double())
+for(i in 1:100) {
+ thresholdspecs[i,] <- unlist(thresholds[i])
+}
+mean(thresholdspecs$threshold)
+
+xtuned_decision_Thresh<- ifelse(xtuned_table$xgbpreds > mean(thresholdspecs$threshold),'PAH','HC')
+confusionMatrix(as.factor(xtuned_decision_Thresh),as.factor(validation$diagnosis), positive = "PAH")
+
+```
+
+```{r}
+table(training$diagnosis)
+table(validation$diagnosis)
+
+```
+
+```{r}
+rownames(pheno) <- pheno$SampleID
+targetmat$SampleID <- gsub("^X", "", rownames(targetmat))
+targjoin<- inner_join(pheno, targetmat, by = "SampleID")
+targjoint<- targjoin
+indx<- sapply(targjoint, is.character)
+targjoint[indx] <- lapply(targjoint[indx], function(x) as.numeric(x))
+
+a<- for(x in 1:551){is.numeric(targetmat[,x])}
+indx<- sapply(validation.data, is.factor)
+validation.data[indx]<- lapply(validation.data[indx],function(x) as.numeric(as.character(x)))
+```
+
+```{r}
+#save.image(file = "XGB2miR.RData")
+#load(file = "XGB2miR.RData")
+```
+
+```{r, eval = FALSE}
+cortree<- cor(ml.Spear[-1])
+library(corrplot)
+corrplot(cortree, type = "upper",  diag = FALSE, method = "color", order = "hclust", tl.col = "black",col=brewer.pal(n=8, name="RdYlBu"))
+
+
+```
+
+# Correlations
+
+## Demographic
+
+```{r}
+full<- rbind(training, validation) %>% select(.,-diagnosis)
+rownames(pheno) <- make.names(pheno$SampleID)
+ageforcor<- merge(full, select(pheno, Age_controls_sample_patients_diagnosis), by = 0) %>% select(-Row.names) %>% mutate_all(type.convert) %>% mutate_if(is.character, as.numeric)
+cor(ageforcor) %>% as.data.frame()%>% select(Age_controls_sample_patients_diagnosis) %>% arrange(desc(abs(.))) %>% head()
+```
+
+## Lung Function
+
+```{r}
+fvc<- merge(full, select(pheno, lf_fvc_liters), by = 0) %>% filter(!is.na(lf_fvc_liters)) %>% select(-Row.names) %>% mutate_all(type.convert) %>% mutate_if(is.character, as.numeric)
+cor(fvc) %>% as.data.frame()%>% select(lf_fvc_liters) %>% arrange(desc(abs(.))) %>% head()
+
+fev1<- merge(full, select(pheno, lf_fev1_liters), by = 0) %>% filter(!is.na(lf_fev1_liters)) %>% select(-Row.names) %>% mutate_all(type.convert) %>% mutate_if(is.character, as.numeric)
+cor(fev1) %>% as.data.frame()%>% select(lf_fev1_liters) %>% arrange(desc(abs(.))) %>% head()
+
+kco<- merge(full, select(pheno, lf_kco_pc), by = 0) %>% filter(!is.na(lf_kco_pc)) %>% select(-Row.names) %>% mutate_all(type.convert) %>% mutate_if(is.character, as.numeric)
+cor(kco) %>% as.data.frame()%>% select(lf_kco_pc) %>% arrange(desc(abs(.))) %>% head()
+```
+
+## RHC - PAWP?
+
+```{r}
+mpap<- merge(full, select(pheno, hb_pap_m), by = 0) %>% filter(!is.na(hb_pap_m)) %>% select(-Row.names) %>% mutate_all(type.convert) %>% mutate_if(is.character, as.numeric)
+cor(mpap) %>% as.data.frame()%>% select(hb_pap_m) %>% arrange(desc(abs(.))) %>% head()
+
+pvr<- merge(full, select(pheno, pvr), by = 0) %>% filter(!is.na(pvr)) %>% select(-Row.names) %>% mutate_all(type.convert) %>% mutate_if(is.character, as.numeric)
+cor(pvr) %>% as.data.frame()%>% select(pvr) %>% arrange(desc(abs(.))) %>% head()
+
+ci <-merge(full, select(pheno, ci), by = 0) %>% filter(!is.na(ci)) %>% select(-Row.names) %>% mutate_all(type.convert) %>% mutate_if(is.character, as.numeric)
+cor(ci) %>% as.data.frame()%>% select(ci) %>% arrange(desc(abs(.))) %>% head()
+
+```
+
+## Exercise Capacity
+
+```{r}
+ep_1_distance_meters <-merge(full, select(pheno, ep_1_distance_meters), by = 0) %>% filter(!is.na(ep_1_distance_meters)) %>% select(-Row.names) %>% mutate_all(type.convert) %>% mutate_if(is.character, as.numeric)
+cor(ep_1_distance_meters) %>% as.data.frame()%>% select(ep_1_distance_meters) %>% arrange(desc(abs(.))) %>% head()
+
+```
+
+
+
+
+
